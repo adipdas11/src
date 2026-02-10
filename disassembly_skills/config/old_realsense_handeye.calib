@@ -1,0 +1,20 @@
+parameters:
+  name: realsense_handeye
+  calibration_type: eye_on_base
+  robot_base_frame: u1_base_link
+  robot_effector_frame: rg6_hand_tcp
+  tracking_base_frame: camera_link
+  tracking_marker_frame: tag36h11:0
+  freehand_robot_movement: true
+  move_group_namespace: /
+  move_group: manipulator
+transform:
+  translation:
+    x: 0.0
+    y: 0.0
+    z: 0.0
+  rotation:
+    x: -0.7027134143734347
+    y: -0.6926487909932261
+    z: 0.11091558944320778
+    w: 0.11886648650362806

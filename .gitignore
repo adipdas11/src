@@ -1,0 +1,34 @@
+# Large Data Directories
+vision_training/realsense_data/
+vision_training/record_data/
+vision_training/train_vision_model/
+vision_training/__pycache__/
+vision_training/*.pt
+vision_training/*.pth
+vision_training/*.ckpt
+
+# Editor/IDE
+.vscode/
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+*.swp
+*~
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.env
+.venv
+
+# ROS 2 / Colcon
+build/
+install/
+log/
+*.log
