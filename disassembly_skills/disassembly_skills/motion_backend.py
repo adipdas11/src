@@ -37,29 +37,34 @@ class MotionBackend:
         cr, sr = math.cos(roll * 0.5), math.sin(roll * 0.5)
         return Quaternion(w=cr*cp*cy + sr*sp*sy, x=sr*cp*cy - cr*sp*sy, y=cr*sp*cy + sr*cp*sy, z=cr*cp*sy - sr*sp*cy)
 
-    def move_to_joint_positions(self, target_joints: dict, filter_prefix: str = ""):
+    def move_to_joint_positions(self, target_joints: dict, filter_prefix: str = "", velocity=0.1, acceleration=0.1):
         if not self.state_received.wait(timeout=2.0): return False
         full_goal_map = self.current_joint_positions.copy()
         full_goal_map.update(target_joints)
 
         goal_msg = MoveGroup.Goal()
         goal_msg.request.group_name = self.group_name
+        
         constraints = Constraints()
         for name, pos in full_goal_map.items():
             if filter_prefix in name:
                 jc = JointConstraint()
                 jc.joint_name, jc.position, jc.weight = name, pos, 1.0
-                jc.tolerance_above = jc.tolerance_below = 0.02
+                
+                # --- FIX: Relaxed tolerance for Gripper ---
+                if "rg6" in name:
+                    jc.tolerance_above = jc.tolerance_below = 0.1 
+                else:
+                    jc.tolerance_above = jc.tolerance_below = 0.02
+                # ------------------------------------------
+                
                 constraints.joint_constraints.append(jc)
+        
         goal_msg.request.goal_constraints.append(constraints)
-        return self._send_goal(goal_msg)
+        return self._send_goal(goal_msg, velocity, acceleration)
 
-    def move_to_pose_robust(self, x, y, z, q_dict, link_name, frame_id='world_world'):
-        """
-        Robust IK Solver:
-        1. Checks for KeyError by verifying q_dict content.
-        2. Applies 5-DOF relaxation for xArm5 and fallback for UF850.
-        """
+    def move_to_pose_robust(self, x, y, z, q_dict, link_name, frame_id='world_world', velocity=0.1, acceleration=0.1):
+        """Modified to accept velocity/acceleration and pass to _send_goal."""
         req = GetPositionIK.Request()
         req.ik_request.group_name = self.group_name
         req.ik_request.ik_link_name = link_name
@@ -77,7 +82,7 @@ class MotionBackend:
         target_pose.pose.position.y = y
         target_pose.pose.position.z = z
 
-        # --- BRANCH 1: Strict Orientation (If q_dict provided) ---
+        # --- BRANCH 1: Strict Orientation ---
         if q_dict and all(k in q_dict for k in ['qx', 'qy', 'qz', 'qw']):
             target_pose.pose.orientation.x = q_dict['qx']
             target_pose.pose.orientation.y = q_dict['qy']
@@ -85,21 +90,21 @@ class MotionBackend:
             target_pose.pose.orientation.w = q_dict['qw']
             req.ik_request.pose_stamped = target_pose
             res = self._call_ik_sync(req)
-            if res.error_code.val == 1: return self._process_ik_result(res)
+            if res.error_code.val == 1: 
+                return self._process_ik_result(res, velocity, acceleration)
 
-        # --- BRANCH 2: Relaxation Pipeline (Vertical -> Spherical Search) ---
-        # Level 1: Standard Vertical (Pi, 0, 0)
+        # --- BRANCH 2: Relaxation Pipeline ---
         target_pose.pose.orientation = self._rpy_to_quaternion(math.pi, 0.0, 0.0)
         req.ik_request.pose_stamped = target_pose
         res = self._call_ik_sync(req)
-        if res.error_code.val == 1: return self._process_ik_result(res)
+        if res.error_code.val == 1: 
+            return self._process_ik_result(res, velocity, acceleration)
 
-        # Level 2: Expanded Yaw Relaxation (Wiggling up to 90 degrees)
-        self.node.get_logger().warn(f"[{self.group_name}] Standard vertical failed. Searching reachable window...")
         for yaw in [0.4, -0.4, 0.8, -0.8, 1.57, -1.57]:
             target_pose.pose.orientation = self._rpy_to_quaternion(math.pi, 0.0, yaw)
             res = self._call_ik_sync(req)
-            if res.error_code.val == 1: return self._process_ik_result(res)
+            if res.error_code.val == 1: 
+                return self._process_ik_result(res, velocity, acceleration)
 
         return False
 
@@ -108,13 +113,20 @@ class MotionBackend:
         while not future.done(): time.sleep(0.01)
         return future.result()
 
-    def _process_ik_result(self, response):
+    def _process_ik_result(self, response, velocity, acceleration):
+        """Passes velocity values through to the joint movement."""
         ik_joints = {name: pos for name, pos in zip(response.solution.joint_state.name, response.solution.joint_state.position)}
         prefix = "xarm5" if "xarm" in self.group_name else "u1"
-        return self.move_to_joint_positions(ik_joints, filter_prefix=prefix)
+        return self.move_to_joint_positions(ik_joints, filter_prefix=prefix, velocity=velocity, acceleration=acceleration)
 
-    def _send_goal(self, goal_msg):
+    def _send_goal(self, goal_msg, velocity, acceleration):
+        """The final point where MoveGroup parameters are applied."""
         if not self._action_client.wait_for_server(timeout_sec=5.0): return False
+
+        # Apply the scaling factors to the request
+        goal_msg.request.max_velocity_scaling_factor = velocity
+        goal_msg.request.max_acceleration_scaling_factor = acceleration
+
         future = self._action_client.send_goal_async(goal_msg)
         while not future.done(): time.sleep(0.1)
         handle = future.result()
