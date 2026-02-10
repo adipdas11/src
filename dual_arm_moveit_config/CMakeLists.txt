@@ -16,12 +16,13 @@ install(
 )
 
 install(
-  PROGRAMS 
+  PROGRAMS
   hardware/fake_hardware.py
   hardware/real_hardware.py
 
   scripts/commander.py
   scripts/calibrate_eye_to_hand.py
+  scripts/test_motion_backend.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

@@ -2,206 +2,189 @@
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
+
 from geometry_msgs.msg import PoseStamped, Quaternion
 from moveit_msgs.action import MoveGroup
-from moveit_msgs.msg import Constraints, JointConstraint
+from moveit_msgs.msg import Constraints, JointConstraint, RobotState
 from moveit_msgs.srv import GetPositionIK
 from sensor_msgs.msg import JointState
+
 import math
+import threading
+import time
 
 # ==========================================
-# HELPER: Euler -> Quaternion
+# HELPER FUNCTIONS (Defined at Global Scope)
 # ==========================================
 def rpy_to_quaternion(roll, pitch, yaw):
-    cy = math.cos(yaw * 0.5)
-    sy = math.sin(yaw * 0.5)
-    cp = math.cos(pitch * 0.5)
-    sp = math.sin(pitch * 0.5)
-    cr = math.cos(roll * 0.5)
-    sr = math.sin(roll * 0.5)
+    cy, sy = math.cos(yaw * 0.5), math.sin(yaw * 0.5)
+    cp, sp = math.cos(pitch * 0.5), math.sin(pitch * 0.5)
+    cr, sr = math.cos(roll * 0.5), math.sin(roll * 0.5)
     return Quaternion(w=cr*cp*cy + sr*sp*sy, x=sr*cp*cy - cr*sp*sy, y=cr*sp*cy + sr*cp*sy, z=cr*cp*sy - sr*sp*cy)
 
 class UniversalCommander(Node):
     def __init__(self):
         super().__init__('universal_commander')
+        self.cb_group = ReentrantCallbackGroup()
         
-        # 1. Action Client for Moving
-        self._action_client = ActionClient(self, MoveGroup, 'move_action')
-        self._action_client.wait_for_server()
+        # 1. Action Client for Motion
+        self._action_client = ActionClient(self, MoveGroup, 'move_action', callback_group=self.cb_group)
         
-        # 2. Service Client for IK (The Robustness Engine)
-        self._ik_client = self.create_client(GetPositionIK, 'compute_ik')
-        while not self._ik_client.wait_for_service(timeout_sec=1.0):
-            self.get_logger().info('Waiting for /compute_ik service...')
-            
-        self.get_logger().info("Universal Commander Ready!")
+        # 2. Service Client for IK
+        self._ik_client = self.create_client(GetPositionIK, 'compute_ik', callback_group=self.cb_group)
+        
+        # 3. State Awareness (Seeding Logic for IK stability)
+        self.current_joint_state = None
+        self.joint_sub = self.create_subscription(
+            JointState, 
+            '/joint_states', 
+            self.joint_cb, 
+            10, 
+            callback_group=self.cb_group
+        )
+        
+        self.motion_done_event = threading.Event()
+        self.last_result = None
+        self.get_logger().info("🚀 Universal Commander V8: Multi-Robot Logic Active")
+
+    def joint_cb(self, msg):
+        self.current_joint_state = msg
+
+    def _call_ik_sync(self, req):
+        future = self._ik_client.call_async(req)
+        while not future.done():
+            time.sleep(0.01)
+        return future.result()
 
     def get_ik_solution(self, group_name, target_dict):
         """ 
-        Asks MoveIt: 'Can you physically reach this pose?'
-        Returns joint angles if yes, None if no.
+        Specialized Solver:
+        - UF850: Uses Strict Quaternion from your image.
+        - xArm5: Uses Relaxation (RPY) to ensure 5-DOF success.
         """
-        request = GetPositionIK.Request()
-        request.ik_request.group_name = group_name
-        request.ik_request.robot_state.is_diff = True
-        request.ik_request.avoid_collisions = True
-        request.ik_request.ik_link_name = target_dict['link']
-        request.ik_request.timeout.sec = 1
+        req = GetPositionIK.Request()
+        req.ik_request.group_name = group_name
+        req.ik_request.ik_link_name = target_dict['link']
+        req.ik_request.avoid_collisions = True
+        req.ik_request.timeout.sec = 2 
         
-        # Build Pose
+        # Smart Seeding from current joints
+        req.ik_request.robot_state = RobotState()
+        if self.current_joint_state:
+            req.ik_request.robot_state.joint_state = self.current_joint_state
+        req.ik_request.robot_state.is_diff = True 
+        
         target_pose = PoseStamped()
-        target_pose.header.frame_id = "world_world"
+        target_pose.header.frame_id = "world_world" 
         target_pose.pose.position.x = target_dict['x']
         target_pose.pose.position.y = target_dict['y']
         target_pose.pose.position.z = target_dict['z']
-        target_pose.pose.orientation = rpy_to_quaternion(target_dict['r'], target_dict['p'], target_dict['yaw'])
-        request.ik_request.pose_stamped = target_pose
 
-        future = self._ik_client.call_async(request)
-        rclpy.spin_until_future_complete(self, future)
-        response = future.result()
+        # --- BRANCH: UF850 (6-DOF) ---
+        if "u1" in target_dict['link']:
+            target_pose.pose.orientation.x = target_dict['qx']
+            target_pose.pose.orientation.y = target_dict['qy']
+            target_pose.pose.orientation.z = target_dict['qz']
+            target_pose.pose.orientation.w = target_dict['qw']
+            req.ik_request.pose_stamped = target_pose
+            res = self._call_ik_sync(req)
+            if res and res.error_code.val == 1: return res.solution.joint_state
 
-        if response.error_code.val == 1:
-            return response.solution.joint_state
+        # --- BRANCH: xArm5 (5-DOF) or UF Fallback ---
         else:
-            self.get_logger().error(f"[{group_name}] IK Failed (Error {response.error_code.val}). Target unreachable.")
-            return None
+            # Level 1: Strict Vertical
+            target_pose.pose.orientation = rpy_to_quaternion(3.14159, 0.0, 0.0)
+            req.ik_request.pose_stamped = target_pose
+            res = self._call_ik_sync(req)
+            if res and res.error_code.val == 1: return res.solution.joint_state
 
-    def execute_joint_trajectory(self, group_to_move, constraints):
-        """ Sends the solved joint configuration to the controller """
-        goal_msg = MoveGroup.Goal()
-        goal_msg.request.group_name = group_to_move
-        goal_msg.request.num_planning_attempts = 10
-        goal_msg.request.allowed_planning_time = 5.0
-        goal_msg.request.max_velocity_scaling_factor = 0.5
-        goal_msg.request.max_acceleration_scaling_factor = 0.5
-        
-        goal_msg.request.goal_constraints.append(constraints)
+            # Level 2: Yaw Relaxation
+            self.get_logger().warn(f"[{group_name}] Falling back to relaxation...")
+            for yaw in [0.2, -0.2, 0.5]:
+                req.ik_request.pose_stamped.pose.orientation = rpy_to_quaternion(3.14159, 0.0, yaw)
+                res = self._call_ik_sync(req)
+                if res and res.error_code.val == 1: return res.solution.joint_state
 
-        self.get_logger().info(f"Sending trajectory to {group_to_move}...")
-        self._send_goal_future = self._action_client.send_goal_async(goal_msg)
-        self._send_goal_future.add_done_callback(self.goal_response_callback)
+        self.get_logger().error(f"[{group_name}] IK Failed definitively.")
+        return None
 
     def create_constraints_from_joints(self, joint_state, filter_prefix):
-        """ Converts a full robot state into constraints for a specific arm """
         constraints = Constraints()
-        constraints.name = "IK Joint Target"
-        
         for name, pos in zip(joint_state.name, joint_state.position):
             if filter_prefix in name:
                 jc = JointConstraint()
-                jc.joint_name = name
-                jc.position = pos
-                jc.tolerance_above = 0.01
-                jc.tolerance_below = 0.01
-                jc.weight = 1.0
+                jc.joint_name, jc.position, jc.weight = name, pos, 1.0
+                jc.tolerance_above = jc.tolerance_below = 0.02
                 constraints.joint_constraints.append(jc)
         return constraints
 
-    # ==========================================
-    # USER METHODS
-    # ==========================================
+    def execute_joint_trajectory(self, group_name, constraints):
+        self.motion_done_event.clear()
+        goal_msg = MoveGroup.Goal()
+        goal_msg.request.group_name = group_name
+        goal_msg.request.num_planning_attempts = 50 
+        goal_msg.request.allowed_planning_time = 20.0
+        goal_msg.request.max_velocity_scaling_factor = 0.2
+        goal_msg.request.goal_constraints.append(constraints)
 
-    def move_single_arm(self, group_name, target):
-        self.get_logger().info(f"--- Moving Single Arm: {group_name} ---")
-        
-        # 1. Solve IK
-        joints = self.get_ik_solution(group_name, target)
-        if not joints: return
+        self.get_logger().info(f"Moving {group_name}...")
+        self._action_client.send_goal_async(goal_msg).add_done_callback(self.goal_response_callback)
 
-        # 2. Convert to Constraints
-        # Detect prefix (xarm5 or u1)
-        prefix = "xarm5" if "xarm" in group_name else "u1"
-        constraints = self.create_constraints_from_joints(joints, prefix)
+    def move_dual_arms_sequentially(self, x_goal, u_goal):
+        """ Moves xArm5 then UF850 to avoid workspace collision issues. """
+        self.get_logger().info("--- Starting Sequential Move ---")
         
-        # 3. Execute
-        self.execute_joint_trajectory(group_name, constraints)
+        # --- PHASE 1: xArm5 ---
+        x_js = self.get_ik_solution("xarm_arm", x_goal)
+        if x_js:
+            self.execute_joint_trajectory("xarm_arm", self.create_constraints_from_joints(x_js, "xarm5"))
+            if not self.motion_done_event.wait(timeout=25.0): return
 
-    def move_dual_arms(self, xarm_target, uf_target):
-        self.get_logger().info("--- Moving Dual Arms ---")
-        
-        # 1. Solve xArm IK
-        xarm_joints = self.get_ik_solution("xarm_arm", xarm_target)
-        if not xarm_joints: return
+        # --- PHASE 2: UF850 ---
+        u_js = self.get_ik_solution("uf_arm", u_goal)
+        if u_js:
+            self.execute_joint_trajectory("uf_arm", self.create_constraints_from_joints(u_js, "u1"))
+            self.motion_done_event.wait(timeout=25.0)
 
-        # 2. Solve UF850 IK
-        uf_joints = self.get_ik_solution("uf_arm", uf_target)
-        if not uf_joints: return
-
-        # 3. Combine Constraints
-        constraints = Constraints()
-        constraints.name = "Dual Target"
-        
-        # Add xArm joints
-        c1 = self.create_constraints_from_joints(xarm_joints, "xarm5")
-        constraints.joint_constraints.extend(c1.joint_constraints)
-        
-        # Add UF850 joints
-        c2 = self.create_constraints_from_joints(uf_joints, "u1")
-        constraints.joint_constraints.extend(c2.joint_constraints)
-        
-        # 4. Execute on 'dual_arms' group
-        self.execute_joint_trajectory("dual_arms", constraints)
-
-    # ==========================================
-    # CALLBACKS
-    # ==========================================
     def goal_response_callback(self, future):
-        goal_handle = future.result()
-        if not goal_handle.accepted:
-            self.get_logger().error('Goal rejected.')
+        handle = future.result()
+        if not handle.accepted:
+            self.motion_done_event.set()
             return
-        self.get_logger().info('Goal accepted! Executing...')
-        self._get_result_future = goal_handle.get_result_async()
-        self._get_result_future.add_done_callback(self.get_result_callback)
+        handle.get_result_async().add_done_callback(self.get_result_callback)
 
     def get_result_callback(self, future):
-        result = future.result().result
-        if result.error_code.val == 1:
-            self.get_logger().info('SUCCESS: Motion Complete!')
-        else:
-            self.get_logger().error(f'FAILED: Error Code {result.error_code.val}')
+        self.last_result = future.result().result.error_code.val
+        if self.last_result == 1: self.get_logger().info("✅ Success")
+        else: self.get_logger().error(f"❌ Failed: {self.last_result}")
+        self.motion_done_event.set()
 
 def main(args=None):
     rclpy.init(args=args)
     commander = UniversalCommander()
+    executor = MultiThreadedExecutor()
+    executor.add_node(commander)
 
-    # ==========================================
-    # 1. DEFINE TARGETS
-    # ==========================================
-    
-    # Target for xArm5 (From your image)
-    # 5-DOF Tip: Always try to keep Roll=3.14 (180), Pitch=0 to point down.
-    xarm_goal = {
-        'x': 0.91008, 'y': 0.13151, 'z': 1.3984,
-        'r': 3.14159, 'p': 0.0, 'yaw': 0.0,
-        'link': "xarm5_tool0"
+    # TARGETS
+    x_target = {'x': 0.85, 'y': 0.04, 'z': 1.07, 'link': "xarm5_tool0"}
+    u_target = {
+        'x': 0.82887, 'y': -0.20629, 'z': 1.0172, 
+        'qx': 0.55531, 'qy': 0.52615, 'qz': 0.46753, 'qw': -0.44295,
+        'link': "u1_tool0"
     }
 
-    # Target for UF850 (Safe pose)
-    uf_goal = {
-        'x': 0.8, 'y': -0.3, 'z': 1.1,
-        'r': 3.14, 'p': 0.0, 'yaw': 1.57,
-        'link': "rg6_hand_tcp"
-    }
-
-    # ==========================================
-    # 2. SELECT ACTION (Uncomment one)
-    # ==========================================
-
-    # MODE A: Move ONLY xArm5
-    # commander.move_single_arm("xarm_arm", xarm_goal)
-
-    # MODE B: Move ONLY UF850
-    # commander.move_single_arm("uf_arm", uf_goal)
-
-    # MODE C: Move BOTH Simultaneous
-    commander.move_dual_arms(xarm_goal, uf_goal)
+    thread = threading.Thread(target=commander.move_dual_arms_sequentially, arACCgs=(x_target, u_target))
+    thread.start()
 
     try:
-        rclpy.spin(commander)
+        executor.spin()
     except KeyboardInterrupt:
         pass
+    finally:
+        commander.destroy_node()
+        rclpy.shutdown()
 
 if __name__ == '__main__':
     main()

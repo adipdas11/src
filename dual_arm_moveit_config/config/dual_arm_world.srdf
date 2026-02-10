@@ -31,7 +31,7 @@
         <group name="xarm_arm"/>
         <group name="uf_arm"/>
         <group name="rg6_gripper"/>
-        <group name="slider"/>
+        <!-- <group name="slider"/> -->
     </group>
 
 
