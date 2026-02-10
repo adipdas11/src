@@ -31,7 +31,7 @@ setup(
         'console_scripts': [
             # Grasp Test            
             'test_grasp_uf850 = disassembly_skills.test_grasp_uf850:main',
-            'verify_calibration_aruco = disassembly_skills.verify_calibration_aruco:main',
+            'detect_aruco = disassembly_skills.detect_aruco:main',
             'aruco_navigator = disassembly_skills.aruco_navigation_node:main'
         ],
     },

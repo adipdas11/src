@@ -1,129 +1,124 @@
 #!/usr/bin/env python3
 import rclpy
+from rclpy.node import Node
 from rclpy.action import ActionClient
-from geometry_msgs.msg import PoseStamped, Quaternion, Pose
 from moveit_msgs.action import MoveGroup
-from moveit_msgs.msg import Constraints, JointConstraint
+from moveit_msgs.msg import Constraints, JointConstraint, RobotState
 from moveit_msgs.srv import GetPositionIK
+from geometry_msgs.msg import PoseStamped, Quaternion
+from sensor_msgs.msg import JointState
+import threading
 import math
+import time
 
 class MotionBackend:
-    def __init__(self, node, group_name):
+    def __init__(self, node: Node, group_name: str):
         self.node = node
         self.group_name = group_name
+        self._action_client = ActionClient(self.node, MoveGroup, 'move_action')
+        self._ik_client = self.node.create_client(GetPositionIK, 'compute_ik')
         
-        # Action Client for Motion Execution
-        self._action_client = ActionClient(node, MoveGroup, 'move_action')
-        # Service Client for IK (The Robustness Engine)
-        self._ik_client = node.create_client(GetPositionIK, 'compute_ik')
+        self.current_joint_msg = None
+        self.current_joint_positions = {}
+        self.state_received = threading.Event()
         
-        if not self._action_client.wait_for_server(timeout_sec=2.0):
-            self.node.get_logger().warn(f"Action Server not found for {group_name}")
+        self.joint_sub = self.node.create_subscription(
+            JointState, '/joint_states', self._joint_state_callback, 10)
 
-    def rpy_to_quaternion(self, roll, pitch, yaw):
-        """ 
-        Stable Euler to Quaternion conversion from your working code.
-        Ensures consistent orientation for 5-DOF IK.
+    def _joint_state_callback(self, msg):
+        self.current_joint_msg = msg
+        for name, pos in zip(msg.name, msg.position):
+            self.current_joint_positions[name] = pos
+        self.state_received.set()
+
+    def _rpy_to_quaternion(self, roll, pitch, yaw):
+        cy, sy = math.cos(yaw * 0.5), math.sin(yaw * 0.5)
+        cp, sp = math.cos(pitch * 0.5), math.sin(pitch * 0.5)
+        cr, sr = math.cos(roll * 0.5), math.sin(roll * 0.5)
+        return Quaternion(w=cr*cp*cy + sr*sp*sy, x=sr*cp*cy - cr*sp*sy, y=cr*sp*cy + sr*cp*sy, z=cr*cp*sy - sr*sp*cy)
+
+    def move_to_joint_positions(self, target_joints: dict, filter_prefix: str = ""):
+        if not self.state_received.wait(timeout=2.0): return False
+        full_goal_map = self.current_joint_positions.copy()
+        full_goal_map.update(target_joints)
+
+        goal_msg = MoveGroup.Goal()
+        goal_msg.request.group_name = self.group_name
+        constraints = Constraints()
+        for name, pos in full_goal_map.items():
+            if filter_prefix in name:
+                jc = JointConstraint()
+                jc.joint_name, jc.position, jc.weight = name, pos, 1.0
+                jc.tolerance_above = jc.tolerance_below = 0.02
+                constraints.joint_constraints.append(jc)
+        goal_msg.request.goal_constraints.append(constraints)
+        return self._send_goal(goal_msg)
+
+    def move_to_pose_robust(self, x, y, z, q_dict, link_name, frame_id='world_world'):
         """
-        cy = math.cos(yaw * 0.5)
-        sy = math.sin(yaw * 0.5)
-        cp = math.cos(pitch * 0.5)
-        sp = math.sin(pitch * 0.5)
-        cr = math.cos(roll * 0.5)
-        sr = math.sin(roll * 0.5)
-        return Quaternion(
-            w=cr*cp*cy + sr*sp*sy, 
-            x=sr*cp*cy - cr*sp*sy, 
-            y=cr*sp*cy + sr*cp*sy, 
-            z=cr*cp*sy - sr*sp*cy
-        )
-
-    def get_ik(self, target_pose, link_name, frame_id="world"):
-        """Solves IK for a specific pose in a specific frame."""
+        Robust IK Solver:
+        1. Checks for KeyError by verifying q_dict content.
+        2. Applies 5-DOF relaxation for xArm5 and fallback for UF850.
+        """
         req = GetPositionIK.Request()
         req.ik_request.group_name = self.group_name
-        req.ik_request.robot_state.is_diff = True
-        req.ik_request.avoid_collisions = True
         req.ik_request.ik_link_name = link_name
-        req.ik_request.timeout.sec = 2
+        req.ik_request.avoid_collisions = True
+        req.ik_request.timeout.sec = 2 
+        
+        req.ik_request.robot_state = RobotState()
+        if self.current_joint_msg:
+            req.ik_request.robot_state.joint_state = self.current_joint_msg
+        req.ik_request.robot_state.is_diff = True
+        
+        target_pose = PoseStamped()
+        target_pose.header.frame_id = frame_id 
+        target_pose.pose.position.x = x
+        target_pose.pose.position.y = y
+        target_pose.pose.position.z = z
 
-        ps = PoseStamped()
-        ps.header.frame_id = frame_id 
-        ps.pose = target_pose
-        req.ik_request.pose_stamped = ps
+        # --- BRANCH 1: Strict Orientation (If q_dict provided) ---
+        if q_dict and all(k in q_dict for k in ['qx', 'qy', 'qz', 'qw']):
+            target_pose.pose.orientation.x = q_dict['qx']
+            target_pose.pose.orientation.y = q_dict['qy']
+            target_pose.pose.orientation.z = q_dict['qz']
+            target_pose.pose.orientation.w = q_dict['qw']
+            req.ik_request.pose_stamped = target_pose
+            res = self._call_ik_sync(req)
+            if res.error_code.val == 1: return self._process_ik_result(res)
 
+        # --- BRANCH 2: Relaxation Pipeline (Vertical -> Spherical Search) ---
+        # Level 1: Standard Vertical (Pi, 0, 0)
+        target_pose.pose.orientation = self._rpy_to_quaternion(math.pi, 0.0, 0.0)
+        req.ik_request.pose_stamped = target_pose
+        res = self._call_ik_sync(req)
+        if res.error_code.val == 1: return self._process_ik_result(res)
+
+        # Level 2: Expanded Yaw Relaxation (Wiggling up to 90 degrees)
+        self.node.get_logger().warn(f"[{self.group_name}] Standard vertical failed. Searching reachable window...")
+        for yaw in [0.4, -0.4, 0.8, -0.8, 1.57, -1.57]:
+            target_pose.pose.orientation = self._rpy_to_quaternion(math.pi, 0.0, yaw)
+            res = self._call_ik_sync(req)
+            if res.error_code.val == 1: return self._process_ik_result(res)
+
+        return False
+
+    def _call_ik_sync(self, req):
         future = self._ik_client.call_async(req)
-        rclpy.spin_until_future_complete(self.node, future)
-        response = future.result()
+        while not future.done(): time.sleep(0.01)
+        return future.result()
 
-        if response and response.error_code.val == 1:
-            return response.solution.joint_state
-        return None
-
-    def move_to_pose_rpy(self, x, y, z, roll, pitch, yaw, link_name, frame_id="world"):
-        """
-        New Method: Uses RPY logic from your old working code to stabilize xArm5 IK.
-        Combines global coordinates with stable orientation.
-        """
-        target = Pose()
-        target.position.x = x
-        target.position.y = y
-        target.position.z = z
-        target.orientation = self.rpy_to_quaternion(roll, pitch, yaw)
-        
-        return self.move_to_pose(target, link_name, frame_id)
-
-    def move_to_pose(self, target_pose, link_name, frame_id="world"):
-        """Standard pose move using explicit joint constraints."""
-        joints = self.get_ik(target_pose, link_name, frame_id)
-        if not joints:
-            self.node.get_logger().error(f"IK Failed for {self.group_name} in frame {frame_id}")
-            return False
-
-        goal = MoveGroup.Goal()
-        goal.request.group_name = self.group_name
-        goal.request.allowed_planning_time = 10.0 
-        
-        c = Constraints()
-        c.name = "Stable IK Target"
-        
-        # Filter for appropriate robot prefix
+    def _process_ik_result(self, response):
+        ik_joints = {name: pos for name, pos in zip(response.solution.joint_state.name, response.solution.joint_state.position)}
         prefix = "xarm5" if "xarm" in self.group_name else "u1"
-        
-        for name, pos in zip(joints.name, joints.position):
-            if prefix in name:
-                jc = JointConstraint()
-                jc.joint_name = name
-                jc.position = pos
-                jc.tolerance_above = 0.01; jc.tolerance_below = 0.01; jc.weight = 1.0
-                c.joint_constraints.append(jc)
-        
-        goal.request.goal_constraints.append(c)
-        return self._send_goal(goal)
+        return self.move_to_joint_positions(ik_joints, filter_prefix=prefix)
 
-    def move_to_named_target(self, joint_names, joint_values):
-        """Moves to predefined poses using joint constraints."""
-        goal = MoveGroup.Goal()
-        goal.request.group_name = self.group_name
-        
-        c = Constraints()
-        for name, pos in zip(joint_names, joint_values):
-            jc = JointConstraint()
-            jc.joint_name = name
-            jc.position = pos
-            jc.tolerance_above = 0.01; jc.tolerance_below = 0.01; jc.weight = 1.0
-            c.joint_constraints.append(jc)
-        
-        goal.request.goal_constraints.append(c)
-        return self._send_goal(goal)
-
-    def _send_goal(self, goal):
-        """Helper to manage the MoveGroup action lifecycle."""
-        future = self._action_client.send_goal_async(goal)
-        rclpy.spin_until_future_complete(self.node, future)
+    def _send_goal(self, goal_msg):
+        if not self._action_client.wait_for_server(timeout_sec=5.0): return False
+        future = self._action_client.send_goal_async(goal_msg)
+        while not future.done(): time.sleep(0.1)
         handle = future.result()
-        if not handle or not handle.accepted: return False
-
+        if not handle.accepted: return False
         res_future = handle.get_result_async()
-        rclpy.spin_until_future_complete(self.node, res_future)
+        while not res_future.done(): time.sleep(0.1)
         return res_future.result().result.error_code.val == 1
