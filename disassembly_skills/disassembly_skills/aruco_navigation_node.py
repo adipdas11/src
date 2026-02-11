@@ -2,128 +2,170 @@
 import rclpy
 from rclpy.node import Node
 from rclpy.executors import MultiThreadedExecutor
+import tf2_ros
 import threading
-import math
 import time
 
+# --- IMPORT YOUR BACKEND ---
 from disassembly_skills.motion_backend import MotionBackend
 
-# ==========================================
-# GLOBAL CONFIGURATION
-# ==========================================
-MOVE_SPEED = 0.1      
-HOME_SPEED = 0.2      
-GRIPPER_SPEED = 0.3   
+# ================= CONFIGURATION =================
+SPEED = 0.1           
+WAIT_TIME = 3.0         
+HOME_SPEED = 0.1
 
-WORLD_X = 0.84
-WORLD_Y = 0.07
-WORLD_Z = 0.95
-Z_OFFSET = 0.30       
+# Tool Lengths
+OFFSET_XARM_TOOL = 0.24      
+OFFSET_UF850_TOOL = 0.28     
 
-OPEN_DEG = 35.0
-CLOSE_DEG = -35.0 
-HOME_DEG = 0.0
+# Safety Offset (Stop above marker)
+ACTUAL_TARGET_Z_OFFSET = 0.01
 
-LINK_XARM5 = "xarm5_tool0" 
-LINK_UF850 = "u1_tool0"    
+# --- FRAMES (MATCHING YOUR ORIGINAL EXAMPLE) ---
+TARGET_FRAME = 'aruco_target_world'   # The marker
+PLANNING_FRAME = 'world_world'        # The frame MoveIt expects
 
-JOINT_GRIPPER = "rg6_l_out"
-
+# Home Joints
 HOME_JOINTS = {
     'xarm5_joint1': 0.0, 'xarm5_joint2': 0.0, 'xarm5_joint3': -1.57,
     'xarm5_joint4': 1.57, 'xarm5_joint5': 0.0,
     'u1_joint1': 0.0, 'u1_joint2': 0.0, 'u1_joint3': -1.57,
     'u1_joint4': 0.0, 'u1_joint5': -1.57, 'u1_joint6': 0.0
 }
-# ==========================================
+# =================================================
 
-class SequentialWorldTester(Node):
+class SequentialTester(Node):
     def __init__(self):
-        super().__init__('sequential_world_tester')
+        super().__init__('sequential_tester')
+        
+        # 1. Motion Backends
         self.xarm5 = MotionBackend(self, "xarm_arm")
         self.uf850 = MotionBackend(self, "uf_arm")
-        self.gripper = MotionBackend(self, "rg6_gripper")
-        self.get_logger().info(f"🚀 Robust Synchronized Logic V3 Active")
+        
+        # 2. TF Listener
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
-    def wait_for_gripper(self, target_deg, timeout=5.0):
-        """Forces the script to wait until the gripper physically reaches the target."""
-        target_rad = math.radians(target_deg)
-        start_time = time.time()
-        while rclpy.ok() and (time.time() - start_time) < timeout:
-            current_pos = self.gripper.current_joint_positions.get(JOINT_GRIPPER, 999)
-            if abs(current_pos - target_rad) < 0.05: # 0.05 rad tolerance
-                return True
-            time.sleep(0.1)
-        return False
+        self.get_logger().info("🚀 Sequential Tester Ready.")
 
-    def run_test(self):
+    def check_connections(self):
+        """Verifies that MoveIt Action Servers are actually reachable."""
+        print("⏳ Checking connection to MoveGroup servers...")
+        if not self.xarm5._action_client.wait_for_server(timeout_sec=3.0):
+            print("❌ ERROR: xArm5 MoveGroup Action Server NOT found!")
+            return False
+        if not self.uf850._action_client.wait_for_server(timeout_sec=3.0):
+            print("❌ ERROR: UF850 MoveGroup Action Server NOT found!")
+            return False
+        print("✅ MoveGroup Servers Connected.")
+        return True
+
+    def get_target_coordinates(self):
+        """Looks up the Aruco position relative to 'world_world'."""
         try:
-            # --- STEP 1: xArm5 ---
-            print("\n" + "="*50)
-            print("STEP 1: xArm5 Move and Home")
-            input("👉 Press ENTER...")
-            if self.xarm5.move_to_pose_robust(WORLD_X, WORLD_Y, WORLD_Z + Z_OFFSET, {}, LINK_XARM5, velocity=MOVE_SPEED):
-                time.sleep(1.0)
-                self.xarm5.move_to_joint_positions(HOME_JOINTS, "xarm5", velocity=HOME_SPEED)
-                time.sleep(2.0)
-
-            # --- STEP 2: UF850 Position + Gripper ---
-            print("\n" + "="*50)
-            print("STEP 2: UF850 Position + Synchronized Gripper")
-            input("👉 Press ENTER...")
-            
-            if self.uf850.move_to_pose_robust(WORLD_X, WORLD_Y, WORLD_Z + Z_OFFSET, {}, LINK_UF850, velocity=MOVE_SPEED):
-                # 1. OPEN
-                print("Opening Gripper...")
-                self.gripper.move_to_joint_positions({JOINT_GRIPPER: math.radians(OPEN_DEG)}, "rg6", velocity=GRIPPER_SPEED)
-                self.wait_for_gripper(OPEN_DEG)
-                
-                # 2. CLOSE
-                print("Closing Gripper...")
-                self.gripper.move_to_joint_positions({JOINT_GRIPPER: math.radians(CLOSE_DEG)}, "rg6", velocity=GRIPPER_SPEED)
-                self.wait_for_gripper(CLOSE_DEG)
-
-                # 3. RESET GRIPPER
-                print("Resetting Gripper to 0...")
-                self.gripper.move_to_joint_positions({JOINT_GRIPPER: math.radians(HOME_DEG)}, "rg6", velocity=GRIPPER_SPEED)
-                self.wait_for_gripper(HOME_DEG)
-                
-                # 4. UF850 HOME
-                time.sleep(1.0) # Safety buffer before arm motion
-                print("Returning UF850 to Home...")
-                self.uf850.move_to_joint_positions(HOME_JOINTS, "u1", velocity=HOME_SPEED)
-                time.sleep(2.0)
-
-            # --- STEP 3: UF850 Full Pose + Return Home ---
-            print("\n" + "="*50)
-            print("STEP 3: UF850 Full Pose and Mandatory Return")
-            input("👉 Press ENTER...")
-            
-            # Quaternion from captured image
-            u1_q_image = {'qx': 0.55531, 'qy': 0.52615, 'qz': 0.46753, 'qw': -0.44295}
-            
-            # Execute Pose
-            success_pose = self.uf850.move_to_pose_robust(WORLD_X, WORLD_Y, WORLD_Z + Z_OFFSET, u1_q_image, LINK_UF850, velocity=MOVE_SPEED)
-            
-            # Force Home Return regardless of 'success_pose' bool value (to ensure it doesn't skip)
-            time.sleep(2.0) 
-            print("Final return to Home sequence starting...")
-            self.uf850.move_to_joint_positions(HOME_JOINTS, "u1", velocity=HOME_SPEED)
-            time.sleep(2.0)
-
-            print("\n✅ Sequence Finished.")
-
+            # We transform FROM aruco_target_world TO world_world
+            if self.tf_buffer.can_transform(PLANNING_FRAME, TARGET_FRAME, rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=2.0)):
+                t = self.tf_buffer.lookup_transform(PLANNING_FRAME, TARGET_FRAME, rclpy.time.Time())
+                return t.transform.translation.x, t.transform.translation.y, t.transform.translation.z
+            else:
+                self.get_logger().warn(f"Wait: Transform {PLANNING_FRAME} -> {TARGET_FRAME} missing.")
+                return None
         except Exception as e:
-            self.get_logger().error(f"Sequence interrupted: {e}")
+            self.get_logger().error(f"TF Lookup Error: {e}")
+            return None
+
+    def run_sequence(self):
+        time.sleep(1.0) 
+        
+        # 1. Verify Connections
+        if not self.check_connections():
+            return
+
+        print("\n" + "="*50)
+        print(f"🔎 Looking for Target TF in frame: {PLANNING_FRAME}...")
+        
+        coords = self.get_target_coordinates()
+        if coords is None:
+            print("❌ Target not found! Is 'detect_aruco' running?")
+            return
+
+        tx, ty, tz = coords
+        print(f"✅ FOUND ARUCO MARKER AT (in {PLANNING_FRAME}):\n   X={tx:.3f}, Y={ty:.3f}, Z={tz:.3f}")
+
+        # ==========================================
+        # STEP 1: UF850 Motion (FIRST)
+        # ==========================================
+        print("\n" + "-"*30)
+        print("🤖 STEP 1: UF850 Motion Prep")
+
+        uf_z = tz + OFFSET_UF850_TOOL + ACTUAL_TARGET_Z_OFFSET
+        
+        print(f"   Target: {uf_z:.3f} (Marker Z={tz:.3f} + Tool={OFFSET_UF850_TOOL} + Offset={ACTUAL_TARGET_Z_OFFSET})")
+        
+        # --- USER INPUT ---
+        input("👉 Press ENTER to move UF850...")
+
+        print(f"   🚀 Sending Goal to MoveIt in frame '{PLANNING_FRAME}'...")
+        success = self.uf850.move_to_pose_robust(
+            tx, ty, uf_z, {}, 
+            link_name="u1_tool0", 
+            frame_id=PLANNING_FRAME,  # <--- CRITICAL: Using world_world
+            velocity=SPEED
+        )
+
+        if success:
+            print(f"   ✅ Reached! Waiting {WAIT_TIME}s...")
+            time.sleep(WAIT_TIME)
+            print("   🏠 UF850 Returning Home...")
+            self.uf850.move_to_joint_positions(HOME_JOINTS, "u1", velocity=HOME_SPEED)
+        else:
+            print("   ❌ UF850 Move Failed! (Check MoveIt Console for errors)")
+            return
+
+        time.sleep(1.0) 
+
+        # ==========================================
+        # STEP 2: xArm5 Motion (SECOND)
+        # ==========================================
+        print("\n" + "-"*30)
+        print("🤖 STEP 2: xArm5 Motion Prep")
+        
+        xarm_z = tz + OFFSET_XARM_TOOL + ACTUAL_TARGET_Z_OFFSET
+        
+        print(f"   Target: {xarm_z:.3f} (Marker Z={tz:.3f} + Tool={OFFSET_XARM_TOOL} + Offset={ACTUAL_TARGET_Z_OFFSET})")
+        
+        # --- USER INPUT ---
+        input("👉 Press ENTER to move xArm5...")
+
+        print(f"   🚀 Sending Goal to MoveIt in frame '{PLANNING_FRAME}'...")
+        success = self.xarm5.move_to_pose_robust(
+            tx, ty, xarm_z, {}, 
+            link_name="xarm5_link5", 
+            frame_id=PLANNING_FRAME,  
+            velocity=SPEED
+        )
+
+        if success:
+            print(f"   ✅ Reached! Waiting {WAIT_TIME}s...")
+            time.sleep(WAIT_TIME)
+            print("   🏠 xArm Returning Home...")
+            self.xarm5.move_to_joint_positions(HOME_JOINTS, "xarm5", velocity=HOME_SPEED)
+        else:
+            print("   ❌ xArm Move Failed! (Check MoveIt Console for errors)")
+
+        print("\n✅ Sequence Complete.")
 
 def main(args=None):
     rclpy.init(args=args)
-    node = SequentialWorldTester()
+    node = SequentialTester()
     executor = MultiThreadedExecutor()
     executor.add_node(node)
+    
     thread = threading.Thread(target=executor.spin, daemon=True)
     thread.start()
-    node.run_test()
+    
+    node.run_sequence()
+    
     node.destroy_node()
     rclpy.shutdown()
 
