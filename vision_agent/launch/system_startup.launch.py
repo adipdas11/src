@@ -2,28 +2,35 @@ from launch import LaunchDescription
 from launch.actions import IncludeLaunchDescription, LogInfo, TimerAction
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch_ros.substitutions import FindPackageShare
+import os 
 
 def generate_launch_description():
     # --- 1. DEFINE PATHS ---
-    rs_pkg = FindPackageShare('realsense2_camera')
-    tool_pkg = FindPackageShare('tool_camera_pkg')
-    agent_pkg = FindPackageShare('vision_agent')
+    # Using os.path.join is safer than manual string concatenation
+    rs_pkg_share = FindPackageShare('realsense2_camera')
+    tool_pkg_share = FindPackageShare('tool_camera_pkg')
+    agent_pkg_share = FindPackageShare('vision_agent')
 
     # --- 2. DEFINE LAUNCH ACTIONS ---
     
     # A. RealSense (Global Scout)
+    # Added launch_arguments here
     launch_realsense = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource([rs_pkg, '/launch/rs_launch.py'])
+        PythonLaunchDescriptionSource([rs_pkg_share, '/launch/rs_launch.py']),
+        launch_arguments={
+            'pointcloud.enable': 'true',
+            'align_depth.enable': 'true'
+        }.items()
     )
 
     # B. Tool Camera (Local Sniper)
     launch_tool_cam = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource([tool_pkg, '/launch/tool_camera.launch.py'])
+        PythonLaunchDescriptionSource([tool_pkg_share, '/launch/tool_camera.launch.py'])
     )
 
     # C. Vision Agent (Brain)
     launch_agent = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource([agent_pkg, '/launch/start_vision.launch.py'])
+        PythonLaunchDescriptionSource([agent_pkg_share, '/launch/start_vision.launch.py'])
     )
 
     # --- 3. CREATE STARTUP SEQUENCE WITH LOGS ---

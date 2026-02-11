@@ -152,15 +152,15 @@ class AgentNode(Node):
         # 4. SUBSCRIBERS
         self.sub_global = self.create_subscription(CompressedImage, '/camera/camera/color/image_raw/compressed', self.cb_global, qos_profile_sensor_data)
         self.sub_local = self.create_subscription(CompressedImage, '/tool_cam/image_raw/compressed', self.cb_local, qos_profile_sensor_data)
-        
-        # FT300 SUBSCRIBER
-        self.sub_wrench = self.create_subscription(WrenchStamped, '/robotiq_ft_wrench', self.cb_wrench, 10)
+        self.sub_wrench = self.create_subscription(WrenchStamped, '/robotiq_force_torque_sensor_broadcaster/wrench', self.cb_wrench, 10)
         self.latest_wrench = None
 
         # 5. PUBLISHERS
         self.json_pub = self.create_publisher(String, '/vision/agent_state', 10)
         self.bin_pub = self.create_publisher(String, '/vision/bin_coordinates', 10)
         self.debug_pub_compressed = self.create_publisher(CompressedImage, '/vision/debug_feed/compressed', 10)
+        # --- NEW: RAW IMAGE PUBLISHER FOR RVIZ ---
+        self.debug_pub_raw = self.create_publisher(Image, '/vision/debug_feed/raw', 10)
         
         self.frame_global = None
         self.frame_local = None
@@ -219,7 +219,7 @@ class AgentNode(Node):
             draw_text(panel, "No parts detected", col1_x, y, 0.85, (100, 100, 100), 2)
 
         # --- COL 2: TOOL STATUS & FORCE ---
-        col2_x = width // 2 - 50
+        col2_x = width // 2 - 120 
         draw_text(panel, "TOOL & SENSORS", col2_x, 80, 0.75, (200, 200, 200), 2)
         
         # Classification Status
@@ -229,7 +229,7 @@ class AgentNode(Node):
         elif state == "SCREWED": box_color = (0, 140, 255)
         elif "MISALIGN" in state: box_color = (0, 0, 255)
         
-        cv2.rectangle(panel, (col2_x, 100), (col2_x + 300, 160), box_color, -1)
+        cv2.rectangle(panel, (col2_x, 100), (col2_x + 400, 160), box_color, -1)
         draw_text(panel, state, col2_x + 20, 140, 0.9, (255, 255, 255), 2)
         
         # FT300 Data
@@ -237,7 +237,6 @@ class AgentNode(Node):
         if wrench_data:
             fz = wrench_data.wrench.force.z
             tz = wrench_data.wrench.torque.z
-            # Simple Logic: Turn Red if Force is high (>10N)
             f_color = (0, 255, 0) if abs(fz) < 10.0 else (0, 0, 255)
             draw_text(panel, f"Force Z:  {fz:.2f} N", col2_x, y, 0.85, f_color, 2)
             draw_text(panel, f"Torque Z: {tz:.3f} Nm", col2_x, y+35, 0.85, (180, 180, 180), 2)
@@ -433,7 +432,16 @@ class AgentNode(Node):
             
             cv2.putText(final_frame, "GLOBAL CAMERA", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
             cv2.putText(final_frame, "TOOL CAMERA", (viz_g.shape[1]+20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
+            
+            # Publish Compressed
             self.debug_pub_compressed.publish(self.bridge.cv2_to_compressed_imgmsg(final_frame))
+            
+            # --- NEW: PUBLISH RAW IMAGE ---
+            raw_msg = self.bridge.cv2_to_imgmsg(final_frame, "bgr8")
+            raw_msg.header.stamp = self.get_clock().now().to_msg()
+            raw_msg.header.frame_id = "vision_debug"
+            self.debug_pub_raw.publish(raw_msg)
+            
         except Exception as e:
             self.get_logger().error(f"Vis Error: {e}")
 

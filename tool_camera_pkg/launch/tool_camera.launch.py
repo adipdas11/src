@@ -18,11 +18,11 @@ def generate_launch_description():
             name='tool_camera',
             namespace='tool_cam',
             parameters=[{
-                'video_device': '/dev/video4',  # Verify this port!
+                'video_device': '/dev/video10',  
                 'framerate': 30.0,
                 'image_width': 640,
                 'image_height': 480,
-                'pixel_format': 'yuyv2rgb',     # The format that worked for you
+                'pixel_format': 'yuyv2rgb',     
                 'camera_name': 'tool_camera',
                 'camera_info_url': 'file://' + config_file
             }]
