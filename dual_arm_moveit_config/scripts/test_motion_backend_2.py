@@ -26,7 +26,6 @@ HOME_DEG = 0.0
 
 LINK_XARM5 = "xarm5_tool0" 
 LINK_UF850 = "u1_tool0"    
-
 JOINT_GRIPPER = "rg6_l_out"
 
 HOME_JOINTS = {

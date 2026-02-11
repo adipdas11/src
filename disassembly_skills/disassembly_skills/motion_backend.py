@@ -51,12 +51,11 @@ class MotionBackend:
                 jc = JointConstraint()
                 jc.joint_name, jc.position, jc.weight = name, pos, 1.0
                 
-                # --- FIX: Relaxed tolerance for Gripper ---
+                # RELAX TOLERANCE FOR GRIPPER
                 if "rg6" in name:
                     jc.tolerance_above = jc.tolerance_below = 0.1 
                 else:
                     jc.tolerance_above = jc.tolerance_below = 0.02
-                # ------------------------------------------
                 
                 constraints.joint_constraints.append(jc)
         

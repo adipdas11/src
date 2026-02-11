@@ -23,6 +23,7 @@ install(
   scripts/commander.py
   scripts/calibrate_eye_to_hand.py
   scripts/test_motion_backend.py
+  scripts/test_motion_backend_2.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
