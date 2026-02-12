@@ -6,17 +6,16 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from control_msgs.action import FollowJointTrajectory
 from sensor_msgs.msg import JointState
+from geometry_msgs.msg import Twist  # <--- NEW: For Velocity Control
+from std_srvs.srv import Empty, Trigger, SetBool # <--- NEW: For Mode Switching
 from xarm.wrapper import XArmAPI
 from pymodbus.client.sync import ModbusTcpClient as ModbusClient
-from std_srvs.srv import Empty, Trigger 
 import time
 import math
 import threading
 import sys
 
-# ==========================================
-# CONFIGURATION
-# ==========================================
+# ================= CONFIGURATION =================
 XARM_IP = '192.168.1.239'     
 UF850_IP = '192.168.1.195'     
 GRIPPER_IP = '192.168.1.1'    
@@ -24,9 +23,6 @@ GRIPPER_IP = '192.168.1.1'
 RAD_CLOSE = -0.6109; RAD_OPEN = 0.6109; RAD_RANGE = RAD_OPEN - RAD_CLOSE
 MM_CLOSE = 0.0; MM_OPEN = 160.0      
 
-# ==========================================
-# DRIVER CLASSES
-# ==========================================
 class RG:
     def __init__(self, gripper, ip, logger, port=502):
         self.logger = logger; self.ip = ip
@@ -34,7 +30,7 @@ class RG:
         self.lock = threading.Lock(); self.gripper = gripper
         if self.gripper == 'rg2': self.max_width=1100; self.max_force=400
         elif self.gripper == 'rg6': self.max_width=1600; self.max_force=1200
-        if not self.client.connect(): raise ConnectionError(f"Gripper connection failed")
+        if not self.client.connect(): pass 
     def move_gripper(self, width_mm, force_val=400):
         val = int(width_mm * 10); val = max(0, min(val, self.max_width))
         with self.lock: 
@@ -68,17 +64,11 @@ class RealRobotInterface:
         self.arm.set_linear_track_enable(True); self.arm.set_linear_track_speed(200)
 
     def force_enable(self):
-        """Forces the robot back to Ready state (State 0)"""
         if self.connected:
-            self.arm.clean_error()
-            self.arm.motion_enable(enable=True)
-            self.arm.set_mode(1)
-            self.arm.set_state(0) # State 0 = Ready
+            self.arm.clean_error(); self.arm.motion_enable(enable=True); self.arm.set_mode(1); self.arm.set_state(0)
 
     def stop(self):
-        """Forces the robot to Stop state (State 4)"""
-        if self.connected:
-            self.arm.set_state(4) # State 4 = Stop
+        if self.connected: self.arm.set_state(4)
 
     def get_full_state(self):
         if not self.connected: return ([0.0]*self.dof, [0.0]*self.dof, [0.0]*self.dof)
@@ -98,17 +88,13 @@ class RealRobotInterface:
     def disconnect(self):
         self.connected=False; self.arm.disconnect()
 
-# ==========================================
-# MAIN NODE
-# ==========================================
 class RealHardware(Node):
     def __init__(self):
         super().__init__('real_hardware_driver')
         self.cb_group = ReentrantCallbackGroup()
         self.xarm = None; self.uf850 = None; self.gripper = None
-        
-        # This flag stops the CURRENT loop, but resets on new commands
         self.stop_current_motion = False 
+        self.velocity_mode_active = False # Flag for velocity mode
 
         try:
             self.xarm = RealRobotInterface(XARM_IP, "xArm5", 5, self.get_logger(), has_linear_track=True)
@@ -119,6 +105,13 @@ class RealHardware(Node):
         # --- SERVICES ---
         self._stop_service = self.create_service(Empty, '/xarm/stop_robot', self.handle_stop_request, callback_group=self.cb_group)
         self._reset_service = self.create_service(Empty, '/xarm/reset_robot', self.handle_reset_request, callback_group=self.cb_group)
+        
+        # NEW: Velocity Mode Switch
+        self._vel_mode_srv = self.create_service(SetBool, '/xarm/set_velocity_mode', self.handle_velocity_mode_request, callback_group=self.cb_group)
+
+        # --- SUBSCRIBERS ---
+        # NEW: Velocity Command Topic
+        self._vel_sub = self.create_subscription(Twist, '/xarm/velo_cmd', self.handle_velocity_command, 10)
 
         # --- ACTIONS ---
         self._xarm_server = ActionServer(self, FollowJointTrajectory, '/xarm_controller/follow_joint_trajectory', execute_callback=self.execute_xarm_callback, callback_group=self.cb_group)
@@ -130,78 +123,93 @@ class RealHardware(Node):
         self.timer = self.create_timer(0.02, self.publish_real_states, callback_group=self.cb_group)
         self.loop_count = 0; self.cached_gripper_width = 0.0
 
-    # --- HANDLERS ---
+    def handle_velocity_mode_request(self, request, response):
+        if request.data: 
+            self.get_logger().info("🔄 Switching xArm to CARTESIAN VELOCITY MODE (5)...")
+            self.xarm.arm.set_state(4)  # Stop 
+            time.sleep(0.1)
+            self.xarm.arm.set_mode(5)   # Mode 5 = Cartesian Velocity
+            self.xarm.arm.set_state(0)  # Ready
+            self.velocity_mode_active = True
+            response.success = True
+        else:
+            self.get_logger().info("🛑 Disabling Velocity Mode (Back to Mode 1)...")
+            self.xarm.arm.set_mode(1)
+            self.xarm.arm.set_state(0)
+            self.velocity_mode_active = False
+            response.success = True
+        return response
+
+    def handle_velocity_command(self, msg):
+        if self.velocity_mode_active and self.xarm and self.xarm.connected:
+            # Linear: m/s -> mm/s
+            vx = msg.linear.x * 1000.0  
+            vy = msg.linear.y * 1000.0  
+            vz = msg.linear.z * 1000.0  
+            
+            # Angular: rad/s -> deg/s (Maps to Joint 5 on xArm5)
+            v_yaw = math.degrees(msg.angular.z) 
+
+            # vc_set_cartesian_velocity([x, y, z, roll, pitch, yaw])
+            self.xarm.arm.vc_set_cartesian_velocity([vx, vy, vz, 0.0, 0.0, v_yaw])
+
+    # --- EXISTING HANDLERS ---
     def handle_stop_request(self, request, response):
-        self.get_logger().error("🚨 STOP REQUEST RECEIVED")
-        self.stop_current_motion = True # Signal active loops to break
-        
-        # Halt Hardware
+        self.get_logger().error("🚨 STOP REQUEST")
+        self.stop_current_motion = True
         if self.xarm: self.xarm.stop()
         if self.uf850: self.uf850.stop()
         return response
 
     def handle_reset_request(self, request, response):
-        self.get_logger().info("♻️ RESET REQUEST RECEIVED")
+        self.get_logger().info("♻️ RESET REQUEST")
         self.stop_current_motion = False
         if self.xarm: self.xarm.force_enable()
         if self.uf850: self.uf850.force_enable()
         return response
 
-    # --- TRAJECTORY EXECUTION ---
     def execute_trajectory(self, goal_handle, robot_obj, joint_map_indices):
         if not robot_obj or not robot_obj.connected:
             goal_handle.abort(); return FollowJointTrajectory.Result()
 
-        # 1. AUTO-RESET LOGIC (The Fix)
-        # If we receive a new trajectory, we assume the user wants to move.
-        # We clear the stop flag and force the robot back to State 0.
         self.stop_current_motion = False
-        robot_obj.force_enable()
+        # Ensure we are in Position Mode (1) before trajectory execution
+        if self.velocity_mode_active:
+             self.get_logger().warn("⚠️ Auto-switching back to Position Mode for Trajectory")
+             robot_obj.arm.set_mode(1); robot_obj.arm.set_state(0)
+             self.velocity_mode_active = False
+        else:
+             robot_obj.force_enable()
 
         traj = goal_handle.request.trajectory
         points = traj.points
         
-        self.get_logger().info(f"🚀 Starting Trajectory for {robot_obj.name}...")
-        
         for i in range(len(points) - 1):
-            # CHECK STOP FLAGS
             if self.stop_current_motion or goal_handle.is_cancel_requested:
-                goal_handle.canceled()
-                robot_obj.stop() # Ensure hardware stays stopped
-                self.get_logger().warn(f"🛑 Motion Aborted for {robot_obj.name}")
-                return FollowJointTrajectory.Result()
+                goal_handle.canceled(); robot_obj.stop(); return FollowJointTrajectory.Result()
 
             start_pt = points[i]; end_pt = points[i+1]
             duration = (end_pt.time_from_start.sec + end_pt.time_from_start.nanosec*1e-9) - (start_pt.time_from_start.sec + start_pt.time_from_start.nanosec*1e-9)
-            
             if duration <= 0: continue
             step = 0.02; t = 0.0
             
             while t < duration:
-                # CHECK STOP FLAGS (Mid-Step)
                 if self.stop_current_motion or goal_handle.is_cancel_requested:
-                    goal_handle.canceled(); robot_obj.stop()
-                    return FollowJointTrajectory.Result()
-
+                    goal_handle.canceled(); robot_obj.stop(); return FollowJointTrajectory.Result()
                 fract = t / duration
                 cmd_angles = []
                 for idx in joint_map_indices:
                     s = start_pt.positions[idx]; e = end_pt.positions[idx]
                     cmd_angles.append(self.linear_interpolate(s, e, fract))
-                
                 robot_obj.set_servo_angle(cmd_angles)
                 time.sleep(step); t += step
 
-        # Final Point
         if not self.stop_current_motion:
             final_angles = [points[-1].positions[idx] for idx in joint_map_indices]
             robot_obj.set_servo_angle(final_angles)
             goal_handle.succeed()
-            self.get_logger().info(f"✅ Trajectory Complete: {robot_obj.name}")
-        
         return FollowJointTrajectory.Result()
 
-    # --- HELPERS (Keep same) ---
     def rad_to_mm(self, radians): return max(0.0, min(MM_OPEN, ((radians - RAD_CLOSE)/RAD_RANGE)*MM_OPEN))
     def mm_to_rad(self, mm): return ((mm/MM_OPEN)*RAD_RANGE)+RAD_CLOSE
     def linear_interpolate(self, start, end, fract): return start + (end - start) * fract

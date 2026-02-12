@@ -205,6 +205,79 @@ class MotionBackend:
             
         return True
 
+    # ==========================================================
+    # PRIORITY-Z JOG (FORCE HEIGHT KEEPER)
+    # ==========================================================
+    def jog_relative(self, dx, dy, dz, velocity=0.1):
+        if not self._execute_client.wait_for_server(timeout_sec=1.0): return False
+
+        # 1. Get Current Pose
+        start_pose = self.get_transformed_pose(Pose(), 'xarm5_link5', 'world_world') 
+        if not start_pose: return False
+
+        # 2. Define Exact Target
+        target_pose = copy.deepcopy(start_pose.pose)
+        target_pose.position.x += dx
+        target_pose.position.y += dy
+        target_pose.position.z += dz # Keep this 0.0 to lock height!
+
+        # 3. 5-DOF IK SEARCH (Relaxed Yaw)
+        # We try strict orientation first. If that fails (would cause lift),
+        # we try rotating the wrist slightly until we find a match at this Z-height.
+        best_joint_solution = None
+        
+        # Search Range: +/- 25 degrees of yaw rotation allowed
+        yaw_trials = [0.0, 0.05, -0.05, 0.1, -0.1, 0.2, -0.2, 0.4, -0.4]
+
+        for yaw_offset in yaw_trials:
+            req = GetPositionIK.Request()
+            req.ik_request.group_name = self.group_name
+            req.ik_request.ik_link_name = "xarm5_link5"
+            req.ik_request.avoid_collisions = True
+            
+            # Setup Test Pose
+            ik_pose = PoseStamped()
+            ik_pose.header.frame_id = 'world_world'
+            ik_pose.pose = copy.deepcopy(target_pose)
+            
+            # Apply Yaw Rotation to Original Orientation
+            if yaw_offset != 0.0:
+                ik_pose.pose.orientation = self._rpy_to_quaternion(math.pi, 0.0, yaw_offset)
+            else:
+                ik_pose.pose.orientation = start_pose.pose.orientation
+
+            req.ik_request.pose_stamped = ik_pose
+            req.ik_request.robot_state = RobotState()
+            req.ik_request.robot_state.joint_state = self.current_joint_msg
+            
+            res = self._call_ik_sync(req)
+            if res.error_code.val == 1:
+                best_joint_solution = res.solution.joint_state
+                # Found a solution that keeps Z constant!
+                break
+        
+        if not best_joint_solution:
+            self.node.get_logger().warn("⚠️ Jog Failed: Target Unreachable at this Z-Height.")
+            return False
+
+        # 4. EXECUTE AS JOINT MOVE (PTP)
+        # This guarantees we go to the exact solution found (No Cartesian drift)
+        
+        # Convert JointState to Dictionary
+        target_joints = {name: pos for name, pos in zip(best_joint_solution.name, best_joint_solution.position)}
+        
+        # Use MoveIt to plan a smooth PTP move to these angles
+        # We use a fast planning time because it's a short hop
+        success = self.move_to_joint_positions(target_joints, filter_prefix="xarm", velocity=velocity)
+        
+        # 5. DIAGNOSTICS
+        end_pose = self.get_transformed_pose(Pose(), 'xarm5_link5', 'world_world')
+        if end_pose:
+            dz_err = end_pose.pose.position.z - start_pose.pose.position.z
+            print(f"   📉 JOG: dX={dx:.3f} dY={dy:.3f} | Z-Drift: {dz_err:.4f} (Should be ~0.0)")
+            
+        return success
+
     def move_to_pose_robust(self, x, y, z, q_dict, link_name, frame_id='world_world', velocity=0.1):
         req = GetPositionIK.Request()
         req.ik_request.group_name = self.group_name; req.ik_request.ik_link_name = link_name

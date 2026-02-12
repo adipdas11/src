@@ -35,6 +35,8 @@ setup(
             'aruco_navigator = disassembly_skills.aruco_navigation_node:main',
             'screw_zone_targeter = disassembly_skills.screw_zone_targeter:main',
             'force_guarded_descent = disassembly_skills.force_guarded_descent:main',
+            'visual_servo = disassembly_skills.visual_servo:main',
+            'velocity_backend = disassembly_skills.velocity_backend:main',
         ],
     },
 )
