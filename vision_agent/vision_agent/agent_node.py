@@ -10,7 +10,7 @@ sys.path.insert(0, VENV_PATH)
 
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import Image, CompressedImage
+from sensor_msgs.msg import Image, CompressedImage, CameraInfo
 from geometry_msgs.msg import WrenchStamped 
 from std_msgs.msg import String
 from cv_bridge import CvBridge
@@ -19,10 +19,9 @@ import cv2
 import numpy as np
 from scipy.spatial import distance as dist
 from scipy.optimize import linear_sum_assignment
-from rclpy.qos import qos_profile_sensor_data
 
 # --- USER SETTINGS ---
-DASHBOARD_HEIGHT = 450  
+DASHBOARD_HEIGHT = 500  
 PROCESSING_RATE_HZ = 15.0 
 
 # --- IMPORT AGENTS ---
@@ -30,12 +29,19 @@ from vision_agent.agents.scout import ScoutAgent
 from vision_agent.agents.sniper import SniperAgent
 from vision_agent.agents.referee import RefereeAgent
 
-# --- MODEL PATHS (PRESERVED) ---
+# --- MODEL PATHS ---
 PATH_SCOUT = "/home/adip/workspaces/disassembly_ws/src/vision_training/train_vision_model/project 1 (segmentation)/runs/segment/hdd_scout_run/weights/best.pt"
 PATH_SNIPER = "/home/adip/workspaces/disassembly_ws/src/vision_training/train_vision_model/project 2 (keypoint)/runs/pose/hdd_final_run/weights/best.pt"
 PATH_REFEREE = "/home/adip/workspaces/disassembly_ws/src/vision_training/train_vision_model/project 3 (classification)/runs/classify/hdd_referee_model/weights/best.pt"
 
-# --- ZONE CONFIGURATION (mm) ---
+# --- ZONE CONFIGURATION ---
+# SHAPE_CONFIG = {
+#     0: {"TL": (-10, -200), "TR": (-310, -200), "BR": (-330, 15), "BL": (15, 15)},
+#     1: {"TL": (-115, -15), "TR": (15, -15), "BR": (24, 55), "BL": (-112, 55)},
+#     2: {"TL": (-14, -15), "TR": (85, -15), "BR": (85, 25), "BL": (-17, 25)},
+#     3: {"TL": (-17, -12), "TR": (20, -12), "BR": (0, 160), "BL": (-45, 160)}
+# }
+
 SHAPE_CONFIG = {
     0: {"TL": (-10, -175), "TR": (-355, -175), "BR": (-380, 15), "BL": (15, 15)},
     1: {"TL": (-115, -15), "TR": (15, -15), "BR": (24, 55), "BL": (-112, 55)},
@@ -49,7 +55,7 @@ def calculate_orientation_pca(pts):
     rect = cv2.minAreaRect(pts)
     (w, h) = rect[1]
     if max(w, h) == 0: return 0.0, (0,0), (0,0)
-    if min(w, h) / max(w, h) > 0.85: return None, None, None # Square check
+    if min(w, h) / max(w, h) > 0.85: return None, None, None 
 
     pts_float = pts.reshape(-1, 2).astype(np.float64)
     mean, eigenvectors, eigenvalues = cv2.PCACompute2(pts_float, mean=None)
@@ -123,7 +129,7 @@ class CentroidTracker:
 class AgentNode(Node):
     def __init__(self):
         super().__init__('vision_agent_node')
-        self.get_logger().info("--- Vision System (FT300 + Pose Keys) ---")
+        self.get_logger().info("--- Vision System (FT300 + Pose Keys + 3D Meters) ---")
 
         # 1. LOAD AI MODELS
         try:
@@ -149,29 +155,75 @@ class AgentNode(Node):
         self.buffers = {} 
         self.active_polygons = {} 
 
-        # 4. SUBSCRIBERS
-        self.sub_global = self.create_subscription(CompressedImage, '/camera/camera/color/image_raw/compressed', self.cb_global, qos_profile_sensor_data)
-        self.sub_local = self.create_subscription(CompressedImage, '/tool_cam/image_raw/compressed', self.cb_local, qos_profile_sensor_data)
-        self.sub_wrench = self.create_subscription(WrenchStamped, '/robotiq_force_torque_sensor_broadcaster/wrench', self.cb_wrench, 10)
-        self.latest_wrench = None
+        # --- 4. SUBSCRIBERS (PROTOCOL FIX: RELIABLE) ---
+        # The camera publishes as RELIABLE, so we subscribe with '10' (Default Reliable)
+        
+        # 1. Color (Global)
+        self.sub_global = self.create_subscription(
+            CompressedImage, 
+            '/camera/camera/color/image_raw/compressed', 
+            self.cb_global, 
+            10  
+        )
 
+        # 2. Depth (Aligned)
+        self.sub_depth = self.create_subscription(
+            Image,
+            '/camera/camera/aligned_depth_to_color/image_raw',
+            self.cb_depth,
+            10 
+        )
+
+        # 3. Camera Info (Intrinsics)
+        self.sub_info = self.create_subscription(
+            CameraInfo,
+            '/camera/camera/aligned_depth_to_color/camera_info',
+            self.cb_info,
+            10 
+        )
+        
+        self.sub_local = self.create_subscription(CompressedImage, '/tool_cam/image_raw/compressed', self.cb_local, 10)
+        self.sub_wrench = self.create_subscription(WrenchStamped, '/robotiq_force_torque_sensor_broadcaster/wrench', self.cb_wrench, 10)
+        
         # 5. PUBLISHERS
         self.json_pub = self.create_publisher(String, '/vision/agent_state', 10)
         self.bin_pub = self.create_publisher(String, '/vision/bin_coordinates', 10)
         self.debug_pub_compressed = self.create_publisher(CompressedImage, '/vision/debug_feed/compressed', 10)
-        # --- NEW: RAW IMAGE PUBLISHER FOR RVIZ ---
         self.debug_pub_raw = self.create_publisher(Image, '/vision/debug_feed/raw', 10)
         
+        # State Variables
         self.frame_global = None
+        self.frame_depth_meters = None 
         self.frame_local = None
+        self.latest_wrench = None
+        self.intrinsics = None 
+        
         self.timer = self.create_timer(1.0 / PROCESSING_RATE_HZ, self.processing_loop)
 
     def cb_global(self, msg):
         try: 
             img = self.bridge.compressed_imgmsg_to_cv2(msg, "bgr8")
-            if img.shape[1] > 640: img = cv2.resize(img, (640, 480))
             self.frame_global = img
         except: pass
+
+    def cb_depth(self, msg):
+        try:
+            # Convert 16UC1 (mm) to Float32 (Meters)
+            raw_depth = self.bridge.imgmsg_to_cv2(msg, "16UC1")
+            self.frame_depth_meters = raw_depth.astype(np.float32) / 1000.0
+        except Exception as e:
+            self.get_logger().error(f"Depth Error: {e}")
+
+    def cb_info(self, msg):
+        if self.intrinsics is None:
+            K = msg.k
+            self.intrinsics = {
+                'fx': K[0],
+                'fy': K[4],
+                'cx': K[2],
+                'cy': K[5]
+            }
+            self.get_logger().info(f"✅ Intrinsics Loaded: fx={K[0]:.1f}, fy={K[4]:.1f}")
 
     def cb_local(self, msg):
         try: 
@@ -192,6 +244,42 @@ class AgentNode(Node):
         b['cy'].append(raw_cy)
         return (sum(b['scale'])/len(b['scale']), sum(b['cx'])/len(b['cx']), sum(b['cy'])/len(b['cy']))
 
+    # --- 3D DEPTH CALCULATION (METERS) ---
+    def get_3d_coordinates(self, cx, cy, segments_pts=None):
+        if self.frame_depth_meters is None or self.intrinsics is None:
+            return None
+
+        depth_val_m = 0.0
+        
+        # Strategy 1: Mask-based Median (Best for Shiny HDDs)
+        if segments_pts is not None:
+            mask = np.zeros(self.frame_depth_meters.shape, dtype=np.uint8)
+            cv2.fillPoly(mask, [segments_pts], 255)
+            
+            # Extract depth values only where mask is white
+            valid_depths = self.frame_depth_meters[mask == 255]
+            
+            # Filter noise (values too close to 0)
+            valid_depths = valid_depths[valid_depths > 0.001] 
+            
+            if len(valid_depths) > 0:
+                depth_val_m = float(np.median(valid_depths))
+            else:
+                return None 
+        
+        # Strategy 2: Fallback to center ROI (if no segments)
+        else:
+            h, w = self.frame_depth_meters.shape
+            cx, cy = max(0, min(w-1, cx)), max(0, min(h-1, cy))
+            depth_val_m = float(self.frame_depth_meters[cy, cx])
+            if depth_val_m < 0.001: return None 
+
+        z_m = depth_val_m
+        x_m = (cx - self.intrinsics['cx']) * z_m / self.intrinsics['fx']
+        y_m = (cy - self.intrinsics['cy']) * z_m / self.intrinsics['fy']
+        
+        return (round(x_m, 4), round(y_m, 4), round(z_m, 4))
+
     def draw_wide_dashboard(self, width, objects, bin_locations, status, wrench_data):
         panel = np.zeros((DASHBOARD_HEIGHT, width, 3), dtype=np.uint8)
         def draw_text(img, text, x, y, size=0.8, color=(255, 255, 255), thickness=2):
@@ -210,10 +298,15 @@ class AgentNode(Node):
             for i, obj in enumerate(sorted_objects[:max_items]): 
                 label = obj.get('label', 'Unknown')
                 obj_id = obj.get('id', '?')
-                angle = obj.get('angle', 0.0)
-                display_label = f"#{obj_id}: {label[:12]}"
-                display_label += f" [{int(angle)}d]"
-                draw_text(panel, f"> {display_label}", col1_x, y, 0.85, (0, 255, 0), 2)
+                xyz = obj.get('xyz', None)
+                
+                display_label = f"#{obj_id}: {label[:10]}"
+                if xyz:
+                    display_label += f" Z:{xyz[2]:.3f}m"
+                else:
+                    display_label += " No Depth"
+                    
+                draw_text(panel, f"> {display_label}", col1_x, y, 0.80, (0, 255, 0), 2)
                 y += 35
         else:
             draw_text(panel, "No parts detected", col1_x, y, 0.85, (100, 100, 100), 2)
@@ -222,7 +315,6 @@ class AgentNode(Node):
         col2_x = width // 2 - 120 
         draw_text(panel, "TOOL & SENSORS", col2_x, 80, 0.75, (200, 200, 200), 2)
         
-        # Classification Status
         state = status['state'].upper()
         box_color = (50, 50, 50)
         if state == "UNSCREWED": box_color = (0, 200, 0)
@@ -232,14 +324,25 @@ class AgentNode(Node):
         cv2.rectangle(panel, (col2_x, 100), (col2_x + 400, 160), box_color, -1)
         draw_text(panel, state, col2_x + 20, 140, 0.9, (255, 255, 255), 2)
         
-        # FT300 Data
         y = 210
         if wrench_data:
-            fz = wrench_data.wrench.force.z
-            tz = wrench_data.wrench.torque.z
-            f_color = (0, 255, 0) if abs(fz) < 10.0 else (0, 0, 255)
-            draw_text(panel, f"Force Z:  {fz:.2f} N", col2_x, y, 0.85, f_color, 2)
-            draw_text(panel, f"Torque Z: {tz:.3f} Nm", col2_x, y+35, 0.85, (180, 180, 180), 2)
+            f = wrench_data.wrench.force
+            t = wrench_data.wrench.torque
+            
+            draw_text(panel, "FORCE (N)", col2_x, y, 0.75, (200, 200, 200), 2)
+            y += 35
+            def f_col(v): return (0, 0, 255) if abs(v) > 50.0 else (0, 255, 0)
+            
+            draw_text(panel, f"Fx: {f.x:>7.2f}", col2_x + 10, y, 0.85, f_col(f.x), 2)
+            draw_text(panel, f"Fy: {f.y:>7.2f}", col2_x + 10, y + 35, 0.85, f_col(f.y), 2)
+            draw_text(panel, f"Fz: {f.z:>7.2f}", col2_x + 10, y + 70, 0.85, f_col(f.z), 2)
+
+            y += 120
+            draw_text(panel, "TORQUE (Nm)", col2_x, y, 0.75, (200, 200, 200), 2)
+            y += 35
+            draw_text(panel, f"Tx: {t.x:>7.3f}", col2_x + 10, y, 0.85, (180, 180, 180), 2)
+            draw_text(panel, f"Ty: {t.y:>7.3f}", col2_x + 10, y + 35, 0.85, (180, 180, 180), 2)
+            draw_text(panel, f"Tz: {t.z:>7.3f}", col2_x + 10, y + 70, 0.85, (180, 180, 180), 2)
         else:
             draw_text(panel, "FT SENSOR OFF", col2_x, y, 0.85, (0, 0, 255), 2)
 
@@ -259,13 +362,20 @@ class AgentNode(Node):
         return panel
 
     def processing_loop(self):
+        # --- DIAGNOSTICS ---
+        if self.intrinsics is None:
+            self.get_logger().warn("⚠️ Waiting for Camera Intrinsics...", throttle_duration_sec=2.0)
+        elif self.frame_depth_meters is None:
+            self.get_logger().warn("⚠️ Waiting for Depth Image...", throttle_duration_sec=2.0)
+        # -------------------
+
         if self.frame_global is None and self.frame_local is None: return 
         timestamp = self.get_clock().now().nanoseconds
         objects = []
         bin_locations = {} 
         vis_global = None
         
-        # --- 1. GLOBAL VIEW (SCOUT + ARUCO) ---
+        # --- 1. GLOBAL VIEW (SCOUT + ARUCO + DEPTH) ---
         if self.frame_global is not None:
             vis_global = self.frame_global.copy()
             overlay = vis_global.copy()
@@ -330,8 +440,9 @@ class AgentNode(Node):
                 segments = obj.get('segments') or obj.get('mask')
                 angle = 0.0
                 pca_center = (cx, cy)
-                axis_end = (cx, cy)
                 
+                # --- NEW: Get 3D Coordinates (Meters) ---
+                pts = None
                 if segments:
                     pts = np.array(segments, np.int32).reshape((-1, 1, 2))
                     raw_angle, pca_center, axis_end = calculate_orientation_pca(pts)
@@ -342,25 +453,30 @@ class AgentNode(Node):
                          avg_cos = sum(v[0] for v in h)/len(h)
                          avg_sin = sum(v[1] for v in h)/len(h)
                          angle = math.degrees(math.atan2(avg_sin, avg_cos))
+
+                xyz_meters = self.get_3d_coordinates(cx, cy, pts) 
+                if xyz_meters:
+                    obj['xyz'] = xyz_meters # [x_m, y_m, z_m]
                 
                 obj['angle'] = angle 
                 objects.append(obj)
 
                 color = (0, 255, 0)
                 if segments:
-                    pts = np.array(segments, np.int32).reshape((-1, 1, 2))
                     cv2.fillPoly(overlay, [pts], color)
                     cv2.polylines(vis_global, [pts], True, color, 2)
                     if raw_angle is not None:
                          rad = math.radians(angle)
                          smooth_end = (int(cx + math.cos(rad)*50), int(cy + math.sin(rad)*50))
                          cv2.line(vis_global, (cx, cy), smooth_end, (0, 0, 255), 3)
-                         cv2.circle(vis_global, smooth_end, 5, (0, 0, 255), -1)
                 else:
                     cv2.rectangle(overlay, (int(box[0]), int(box[1])), (int(box[2]), int(box[3])), color, -1)
                     cv2.rectangle(vis_global, (int(box[0]), int(box[1])), (int(box[2]), int(box[3])), color, 2)
                 
-                cv2.putText(vis_global, f"ID:{obj_id}", (int(box[0]), int(box[1])-20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                info_text = f"ID:{obj_id}"
+                if xyz_meters: info_text += f" Z:{xyz_meters[2]:.2f}m"
+                cv2.putText(vis_global, info_text, (int(box[0]), int(box[1])-20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                
             cv2.addWeighted(overlay, 0.3, vis_global, 0.7, 0, vis_global)
         else:
             vis_global = np.zeros((480, 640, 3), dtype=np.uint8)
@@ -375,25 +491,19 @@ class AgentNode(Node):
             sniper_data = self.sniper.target(self.frame_local)
             status = self.referee.inspect(self.frame_local)
             
-            # Draw Screws (Cyan)
             for s in sniper_data['screw_heads']:
                 if "center" in s:
                     cx, cy = s["center"]
                     cv2.circle(vis_local, (cx, cy), 5, (255, 255, 0), -1) 
                     cv2.putText(vis_local, "Screw", (cx+10, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
-
-            # Draw Tool Tip (Magenta)
             for t in sniper_data['tool_tips']:
                 if "contact_point" in t:
                     cx, cy = t["contact_point"]
                     cv2.circle(vis_local, (cx, cy), 5, (255, 0, 255), -1)
                     cv2.putText(vis_local, "Tool", (cx+10, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 1)
-
-            # Draw Holes (Red Box)
             for h in sniper_data['holes']:
                 box = h["box"]
                 cv2.rectangle(vis_local, (box[0], box[1]), (box[2], box[3]), (0, 0, 255), 2)
-                cv2.putText(vis_local, "Hole", (box[0], box[1]-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
         else:
             vis_local = np.zeros((480, 640, 3), dtype=np.uint8)
 
@@ -409,7 +519,7 @@ class AgentNode(Node):
         packet = {
             "timestamp": timestamp,
             "global_view": {"objects": objects},
-            "local_view": sniper_data, # Now structured dict
+            "local_view": sniper_data,
             "assembly_state": status,
             "force_torque": wrench_dict
         }
@@ -423,6 +533,7 @@ class AgentNode(Node):
                 h, w = img.shape[:2]
                 scale = target_h / h
                 return cv2.resize(img, (int(w * scale), target_h))
+            
             viz_g = resize_h(vis_global, h_target)
             viz_l = resize_h(vis_local, h_target)
             top_row = np.hstack((viz_g, viz_l))
@@ -430,13 +541,11 @@ class AgentNode(Node):
             dashboard = self.draw_wide_dashboard(top_row.shape[1], objects, bin_locations, status, self.latest_wrench)
             final_frame = np.vstack((top_row, dashboard))
             
-            cv2.putText(final_frame, "GLOBAL CAMERA", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
+            cv2.putText(final_frame, "GLOBAL (RGB+D)", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
             cv2.putText(final_frame, "TOOL CAMERA", (viz_g.shape[1]+20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
             
-            # Publish Compressed
             self.debug_pub_compressed.publish(self.bridge.cv2_to_compressed_imgmsg(final_frame))
             
-            # --- NEW: PUBLISH RAW IMAGE ---
             raw_msg = self.bridge.cv2_to_imgmsg(final_frame, "bgr8")
             raw_msg.header.stamp = self.get_clock().now().to_msg()
             raw_msg.header.frame_id = "vision_debug"

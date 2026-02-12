@@ -32,7 +32,9 @@ setup(
             # Grasp Test            
             'test_grasp_uf850 = disassembly_skills.test_grasp_uf850:main',
             'detect_aruco = disassembly_skills.detect_aruco:main',
-            'aruco_navigator = disassembly_skills.aruco_navigation_node:main'
+            'aruco_navigator = disassembly_skills.aruco_navigation_node:main',
+            'screw_zone_targeter = disassembly_skills.screw_zone_targeter:main',
+            'force_guarded_descent = disassembly_skills.force_guarded_descent:main',
         ],
     },
 )
