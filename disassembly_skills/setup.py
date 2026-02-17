@@ -28,20 +28,12 @@ setup(
         ],
     },
     entry_points={
-        'console_scripts': [
-            # Grasp Test            
-            'test_grasp_uf850 = disassembly_skills.test_grasp_uf850:main',
+        'console_scripts': [         
             'detect_aruco = disassembly_skills.detect_aruco:main',
             'aruco_navigator = disassembly_skills.aruco_navigation_node:main',
-            'screw_zone_targeter = disassembly_skills.screw_zone_targeter:main',
-            'force_guarded_descent = disassembly_skills.force_guarded_descent:main',
-            'visual_servo = disassembly_skills.visual_servo:main',
-            'velocity_backend = disassembly_skills.velocity_backend:main',
             'master_unscrew_agent = disassembly_skills.master_unscrew_agent:main',
-            'object_hold = disassembly_skills.object_hold:main',
-            'hdd_spawner = disassembly_skills.hdd_tf:main',
-            'hdd_grasp_client = disassembly_skills.hdd_grasp_client:main',
-            'unscrew_agent = disassembly_skills.unscrew_agent:main',
+            'object_hold_skill = disassembly_skills.object_hold_skill:main',
+            'unscrew_skill = disassembly_skills.unscrew_skill:main',
             'aruco_tool_camera_calib = disassembly_skills.aruco_tool_camera_calib:main',
         ],
     },
