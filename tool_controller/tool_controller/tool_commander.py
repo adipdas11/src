@@ -2,11 +2,9 @@
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Int8
-from sensor_msgs.msg import JointState
+# from sensor_msgs.msg import JointState  <-- No longer needed
 import serial
 import time
-import math
-import threading
 
 class ToolCommander(Node):
     def __init__(self):
@@ -15,11 +13,9 @@ class ToolCommander(Node):
         # --- Parameters ---
         self.declare_parameter('port', '/dev/ttyACM0')
         self.declare_parameter('baud', 115200)
-        self.declare_parameter('fake_step', 0.15) # Speed of rotation in RViz
         
         self.port = self.get_parameter('port').value
         self.baud = self.get_parameter('baud').value
-        self.step = self.get_parameter('fake_step').value
 
         # --- Hardware Connection ---
         self.ser = None
@@ -36,16 +32,11 @@ class ToolCommander(Node):
         # 1 = Screw (CW), -1 = Unscrew (CCW), 0 = Stop
         self.create_subscription(Int8, 'tool_cmd', self.handle_cmd, 10)
 
-        # --- RViz Visualization Publisher ---
-        # We publish to /joint_states so RViz sees the tool spinning
-        self.joint_pub = self.create_publisher(JointState, '/joint_states', 10)
-        
-        # Internal state for simulation
         self.current_cmd = 0
-        self.tool_angle = 0.0
         
-        # Timer to update visualization (30Hz)
-        self.create_timer(0.033, self.update_visualization)
+        # ❌ DISABLED RVIZ VISUALIZATION TO PREVENT MOVEIT CRASHES ❌
+        # self.joint_pub = self.create_publisher(JointState, '/joint_states', 10)
+        # self.create_timer(0.033, self.update_visualization)
 
     def handle_cmd(self, msg: Int8):
         cmd = msg.data
@@ -64,28 +55,7 @@ class ToolCommander(Node):
             except Exception as e:
                 self.get_logger().error(f"Serial Error: {e}")
 
-    def update_visualization(self):
-        # If stopped, do nothing
-        if self.current_cmd == 0:
-            return
-
-        # Update angle based on command
-        # 1 = Increase angle (CW), -1 = Decrease (CCW)
-        if self.current_cmd == 1:
-            self.tool_angle += self.step
-        elif self.current_cmd == -1:
-            self.tool_angle -= self.step
-            
-        # Keep angle within 0 to 2pi (optional, but cleaner)
-        self.tool_angle %= (2 * math.pi)
-
-        # Publish JointState
-        msg = JointState()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        # IMPORTANT: Replace 'screwdriver_joint' with the ACTUAL joint name from your URDF
-        msg.name = ['screwdriver_joint'] 
-        msg.position = [self.tool_angle]
-        self.joint_pub.publish(msg)
+    # ❌ DISABLED: update_visualization(self) function removed to keep code clean ❌
 
 def main(args=None):
     rclpy.init(args=args)

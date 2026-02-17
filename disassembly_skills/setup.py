@@ -37,6 +37,12 @@ setup(
             'force_guarded_descent = disassembly_skills.force_guarded_descent:main',
             'visual_servo = disassembly_skills.visual_servo:main',
             'velocity_backend = disassembly_skills.velocity_backend:main',
+            'master_unscrew_agent = disassembly_skills.master_unscrew_agent:main',
+            'object_hold = disassembly_skills.object_hold:main',
+            'hdd_spawner = disassembly_skills.hdd_tf:main',
+            'hdd_grasp_client = disassembly_skills.hdd_grasp_client:main',
+            'unscrew_agent = disassembly_skills.unscrew_agent:main',
+            'aruco_tool_camera_calib = disassembly_skills.aruco_tool_camera_calib:main',
         ],
     },
 )
