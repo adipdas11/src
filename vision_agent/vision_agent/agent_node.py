@@ -35,13 +35,6 @@ PATH_SNIPER = "/home/adip/workspaces/disassembly_ws/src/vision_training/train_vi
 PATH_REFEREE = "/home/adip/workspaces/disassembly_ws/src/vision_training/train_vision_model/project 3 (classification)/runs/classify/hdd_referee_model/weights/best.pt"
 
 # --- ZONE CONFIGURATION ---
-# SHAPE_CONFIG = {
-#     0: {"TL": (-10, -200), "TR": (-310, -200), "BR": (-330, 15), "BL": (15, 15)},
-#     1: {"TL": (-115, -15), "TR": (15, -15), "BR": (24, 55), "BL": (-112, 55)},
-#     2: {"TL": (-14, -15), "TR": (85, -15), "BR": (85, 25), "BL": (-17, 25)},
-#     3: {"TL": (-17, -12), "TR": (20, -12), "BR": (0, 160), "BL": (-45, 160)}
-# }
-
 SHAPE_CONFIG = {
     0: {"TL": (-10, -175), "TR": (-355, -175), "BR": (-380, 15), "BL": (15, 15)},
     1: {"TL": (-115, -15), "TR": (15, -15), "BR": (24, 55), "BL": (-112, 55)},
@@ -129,7 +122,7 @@ class CentroidTracker:
 class AgentNode(Node):
     def __init__(self):
         super().__init__('vision_agent_node')
-        self.get_logger().info("--- Vision System (FT300 + Pose Keys + 3D Meters) ---")
+        self.get_logger().info("--- Vision System (FT300 + Pose Keys + 3D Meters + Workspace) ---")
 
         # 1. LOAD AI MODELS
         try:
@@ -155,33 +148,10 @@ class AgentNode(Node):
         self.buffers = {} 
         self.active_polygons = {} 
 
-        # --- 4. SUBSCRIBERS (PROTOCOL FIX: RELIABLE) ---
-        # The camera publishes as RELIABLE, so we subscribe with '10' (Default Reliable)
-        
-        # 1. Color (Global)
-        self.sub_global = self.create_subscription(
-            CompressedImage, 
-            '/camera/camera/color/image_raw/compressed', 
-            self.cb_global, 
-            10  
-        )
-
-        # 2. Depth (Aligned)
-        self.sub_depth = self.create_subscription(
-            Image,
-            '/camera/camera/aligned_depth_to_color/image_raw',
-            self.cb_depth,
-            10 
-        )
-
-        # 3. Camera Info (Intrinsics)
-        self.sub_info = self.create_subscription(
-            CameraInfo,
-            '/camera/camera/aligned_depth_to_color/camera_info',
-            self.cb_info,
-            10 
-        )
-        
+        # 4. SUBSCRIBERS
+        self.sub_global = self.create_subscription(CompressedImage, '/camera/camera/color/image_raw/compressed', self.cb_global, 10)
+        self.sub_depth = self.create_subscription(Image, '/camera/camera/aligned_depth_to_color/image_raw', self.cb_depth, 10)
+        self.sub_info = self.create_subscription(CameraInfo, '/camera/camera/aligned_depth_to_color/camera_info', self.cb_info, 10)
         self.sub_local = self.create_subscription(CompressedImage, '/tool_cam/image_raw/compressed', self.cb_local, 10)
         self.sub_wrench = self.create_subscription(WrenchStamped, '/robotiq_force_torque_sensor_broadcaster/wrench', self.cb_wrench, 10)
         
@@ -191,7 +161,6 @@ class AgentNode(Node):
         self.debug_pub_compressed = self.create_publisher(CompressedImage, '/vision/debug_feed/compressed', 10)
         self.debug_pub_raw = self.create_publisher(Image, '/vision/debug_feed/raw', 10)
         
-        # State Variables
         self.frame_global = None
         self.frame_depth_meters = None 
         self.frame_local = None
@@ -208,7 +177,6 @@ class AgentNode(Node):
 
     def cb_depth(self, msg):
         try:
-            # Convert 16UC1 (mm) to Float32 (Meters)
             raw_depth = self.bridge.imgmsg_to_cv2(msg, "16UC1")
             self.frame_depth_meters = raw_depth.astype(np.float32) / 1000.0
         except Exception as e:
@@ -217,12 +185,7 @@ class AgentNode(Node):
     def cb_info(self, msg):
         if self.intrinsics is None:
             K = msg.k
-            self.intrinsics = {
-                'fx': K[0],
-                'fy': K[4],
-                'cx': K[2],
-                'cy': K[5]
-            }
+            self.intrinsics = {'fx': K[0], 'fy': K[4], 'cx': K[2], 'cy': K[5]}
             self.get_logger().info(f"✅ Intrinsics Loaded: fx={K[0]:.1f}, fy={K[4]:.1f}")
 
     def cb_local(self, msg):
@@ -250,24 +213,15 @@ class AgentNode(Node):
             return None
 
         depth_val_m = 0.0
-        
-        # Strategy 1: Mask-based Median (Best for Shiny HDDs)
         if segments_pts is not None:
             mask = np.zeros(self.frame_depth_meters.shape, dtype=np.uint8)
             cv2.fillPoly(mask, [segments_pts], 255)
-            
-            # Extract depth values only where mask is white
             valid_depths = self.frame_depth_meters[mask == 255]
-            
-            # Filter noise (values too close to 0)
             valid_depths = valid_depths[valid_depths > 0.001] 
-            
             if len(valid_depths) > 0:
                 depth_val_m = float(np.median(valid_depths))
             else:
                 return None 
-        
-        # Strategy 2: Fallback to center ROI (if no segments)
         else:
             h, w = self.frame_depth_meters.shape
             cx, cy = max(0, min(w-1, cx)), max(0, min(h-1, cy))
@@ -301,10 +255,8 @@ class AgentNode(Node):
                 xyz = obj.get('xyz', None)
                 
                 display_label = f"#{obj_id}: {label[:10]}"
-                if xyz:
-                    display_label += f" Z:{xyz[2]:.3f}m"
-                else:
-                    display_label += " No Depth"
+                if xyz: display_label += f" Z:{xyz[2]:.3f}m"
+                else: display_label += " No Depth"
                     
                 draw_text(panel, f"> {display_label}", col1_x, y, 0.80, (0, 255, 0), 2)
                 y += 35
@@ -346,15 +298,27 @@ class AgentNode(Node):
         else:
             draw_text(panel, "FT SENSOR OFF", col2_x, y, 0.85, (0, 0, 255), 2)
 
-        # --- COL 3: BINS ---
+        # --- COL 3: LOCATIONS (BINS + WORKSPACE) ---
         col3_x = width - 350
-        draw_text(panel, "BIN LOCATIONS", col3_x, 80, 0.75, (200, 200, 200), 2)
+        draw_text(panel, "LOCATIONS (Cam Frame)", col3_x, 80, 0.75, (200, 200, 200), 2)
         y = 120
+        
+        # Display Workspace First
+        if "workspace" in bin_locations:
+            ws = bin_locations["workspace"]
+            xyz = ws.get("xyz")
+            if xyz: draw_text(panel, f"WORK: Z:{xyz[2]:.3f}m", col3_x, y, 0.85, (0, 255, 255), 2)
+            y += 40
+
         for i in range(1, 4):
             key = f"bin_{i}"
             if key in bin_locations:
-                coord = bin_locations[key]
-                draw_text(panel, f"BIN {i}: ({coord[0]}, {coord[1]})", col3_x, y, 0.85, (0, 255, 0), 2)
+                bin_data = bin_locations[key]
+                xyz = bin_data.get("xyz")
+                if xyz:
+                    draw_text(panel, f"BIN {i}: Z:{xyz[2]:.3f}m", col3_x, y, 0.85, (0, 255, 0), 2)
+                else:
+                    draw_text(panel, f"BIN {i}: ...", col3_x, y, 0.85, (0, 255, 255), 2)
             else:
                 draw_text(panel, f"BIN {i}: NOT FOUND", col3_x, y, 0.85, (0, 0, 255), 2)
             y += 40
@@ -362,12 +326,10 @@ class AgentNode(Node):
         return panel
 
     def processing_loop(self):
-        # --- DIAGNOSTICS ---
         if self.intrinsics is None:
             self.get_logger().warn("⚠️ Waiting for Camera Intrinsics...", throttle_duration_sec=2.0)
         elif self.frame_depth_meters is None:
             self.get_logger().warn("⚠️ Waiting for Depth Image...", throttle_duration_sec=2.0)
-        # -------------------
 
         if self.frame_global is None and self.frame_local is None: return 
         timestamp = self.get_clock().now().nanoseconds
@@ -391,12 +353,27 @@ class AgentNode(Node):
                         c = corners[i][0].astype(float)
                         raw_cx, raw_cy = np.mean(c[:, 0]), np.mean(c[:, 1])
                         px_per_mm, cx, cy = self.get_smoothed_values(marker_id, raw_px_per_mm, raw_cx, raw_cy)
-                        if marker_id in [1, 2, 3]: bin_locations[f"bin_{marker_id}"] = [int(cx), int(cy)]
+                        
                         poly_pts = []
                         for key in ["TL", "TR", "BR", "BL"]:
                             off_x, off_y = SHAPE_CONFIG[marker_id][key]
                             poly_pts.append([int(cx + (off_x * px_per_mm)), int(cy + (off_y * px_per_mm))])
-                        self.active_polygons[marker_id] = np.array(poly_pts, np.int32).reshape((-1, 1, 2))
+                        
+                        poly_arr = np.array(poly_pts, np.int32).reshape((-1, 1, 2))
+                        self.active_polygons[marker_id] = poly_arr
+
+                        # --- NEW: CALCULATE 3D POSITION FOR ALL MARKERS ---
+                        # Use the marker center point for depth calculation
+                        xyz_meters = self.get_3d_coordinates(int(cx), int(cy), poly_arr)
+                        
+                        # Store in dictionary with readable keys
+                        key_name = "workspace" if marker_id == 0 else f"bin_{marker_id}"
+                        
+                        bin_locations[key_name] = {
+                            "id": int(marker_id),
+                            "px": [int(cx), int(cy)],
+                            "xyz": xyz_meters # [X, Y, Z] relative to camera optical frame
+                        }
 
             workspace_poly = self.active_polygons.get(0, None)
             for m_id, poly in self.active_polygons.items():
@@ -441,7 +418,6 @@ class AgentNode(Node):
                 angle = 0.0
                 pca_center = (cx, cy)
                 
-                # --- NEW: Get 3D Coordinates (Meters) ---
                 pts = None
                 if segments:
                     pts = np.array(segments, np.int32).reshape((-1, 1, 2))
@@ -455,8 +431,7 @@ class AgentNode(Node):
                          angle = math.degrees(math.atan2(avg_sin, avg_cos))
 
                 xyz_meters = self.get_3d_coordinates(cx, cy, pts) 
-                if xyz_meters:
-                    obj['xyz'] = xyz_meters # [x_m, y_m, z_m]
+                if xyz_meters: obj['xyz'] = xyz_meters 
                 
                 obj['angle'] = angle 
                 objects.append(obj)
@@ -524,7 +499,10 @@ class AgentNode(Node):
             "force_torque": wrench_dict
         }
         self.json_pub.publish(String(data=json.dumps(packet)))
-        if bin_locations: self.bin_pub.publish(String(data=json.dumps(bin_locations)))
+        
+        # --- PUBLISH BIN COORDS ---
+        if bin_locations: 
+            self.bin_pub.publish(String(data=json.dumps(bin_locations)))
 
         # --- 4. VISUALIZATION ---
         try:

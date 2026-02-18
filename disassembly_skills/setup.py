@@ -29,12 +29,9 @@ setup(
     },
     entry_points={
         'console_scripts': [         
-            'detect_aruco = disassembly_skills.detect_aruco:main',
-            'aruco_navigator = disassembly_skills.aruco_navigation_node:main',
-            'master_unscrew_agent = disassembly_skills.master_unscrew_agent:main',
             'object_hold_skill = disassembly_skills.object_hold_skill:main',
             'unscrew_skill = disassembly_skills.unscrew_skill:main',
-            'aruco_tool_camera_calib = disassembly_skills.aruco_tool_camera_calib:main',
+            'master_node = disassembly_skills.master_node:main',
         ],
     },
 )

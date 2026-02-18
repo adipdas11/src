@@ -15,7 +15,7 @@ import time
 import copy 
 import std_srvs.srv
 
-# 👈 [NEW] Use the native Python SDK directly instead of missing ROS msgs
+# Use the native Python SDK directly
 from xarm.wrapper import XArmAPI
 
 # ==========================================
@@ -26,6 +26,8 @@ class MotionBackend:
     def __init__(self, node: Node, group_name: str):
         self.node = node
         self.group_name = group_name
+        
+        # --- ROS 2 MoveIt Interface ---
         self._action_client = ActionClient(self.node, MoveGroup, 'move_action')
         self._execute_client = ActionClient(self.node, ExecuteTrajectory, 'execute_trajectory')
         self._ik_client = self.node.create_client(GetPositionIK, 'compute_ik')
@@ -33,14 +35,19 @@ class MotionBackend:
         self._stop_srv = self.node.create_client(std_srvs.srv.Empty, '/xarm/stop_robot')
         self._reset_srv = self.node.create_client(std_srvs.srv.Empty, '/xarm/reset_robot')
         
-        # 👈 [NEW] Initialize direct connection to the hardware controller
+        # --- Direct Hardware Connection (SDK) ---
         try:
             self.node.get_logger().info(f"🔗 Connecting to native xArm SDK at {ROBOT_IP}...")
             self.arm = XArmAPI(ROBOT_IP)
             self.arm.motion_enable(enable=True)
             self.arm.set_mode(0)
             self.arm.set_state(state=0)
-            self.node.get_logger().info("✅ Native SDK Connected!")
+            
+            # 👈 [CRITICAL FIX] Force Controller to ignore internal TCP offset
+            # We calculate tool length manually in Python, so Controller must be 0
+            self.arm.set_tcp_offset([0, 0, 0, 0, 0, 0])
+            self.node.get_logger().info("✅ Native SDK Connected & TCP Offset Cleared to [0,0,0]!")
+            
         except Exception as e:
             self.node.get_logger().error(f"❌ Failed to connect to xArm SDK: {e}")
 
@@ -48,6 +55,8 @@ class MotionBackend:
         self.current_joint_msg = None
         self.current_joint_positions = {}
         self.state_received = threading.Event()
+        
+        # Subscribers & TF
         self.joint_sub = self.node.create_subscription(JointState, '/joint_states', self._joint_state_callback, 10)
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self.node)
@@ -74,23 +83,24 @@ class MotionBackend:
         return Quaternion(w=cr*cp*cy + sr*sp*sy, x=sr*cp*cy - cr*sp*sy, y=cr*sp*cy + sr*cp*sy, z=cr*cp*sy - sr*sp*cy)
 
     def reset_robot(self):
+        """Resets errors on both hardware SDK and ROS driver side."""
         if hasattr(self, 'arm'):
             self.arm.clean_error()
             self.arm.motion_enable(enable=True)
             self.arm.set_mode(0)
             self.arm.set_state(state=0)
+            # Ensure TCP is cleared on reset too
+            self.arm.set_tcp_offset([0, 0, 0, 0, 0, 0])
             
         if self._reset_srv.wait_for_service(timeout_sec=1.0):
             self._reset_srv.call_async(std_srvs.srv.Empty.Request())
             self.node.get_logger().info("✅ Robot Reset & Enabled")
 
     def stop_immediately(self):
+        """Triggers emergency stop on hardware and cancels ROS goals."""
         if self._current_goal_handle: self._current_goal_handle.cancel_goal_async()
-        
-        # Fire hardware brake via SDK
         if hasattr(self, 'arm'):
             self.arm.set_state(state=4) 
-            
         if self._stop_srv.wait_for_service(timeout_sec=0.1):
             self._stop_srv.call_async(std_srvs.srv.Empty.Request())
             self.node.get_logger().error("!!! HARDWARE STOP SENT !!!")
@@ -110,7 +120,7 @@ class MotionBackend:
             self.node.get_logger().error(f"TF Error: {e}")
             return None
 
-    # --- INTACT MOVEIT 2 FUNCTIONS FOR MACRO PLANNING ---
+    # --- INTACT MOVEIT 2 FUNCTIONS ---
     def move_linear_z_with_force_stop(self, distance_down, velocity_scaling, check_force_callback):
         if not self._execute_client.wait_for_server(timeout_sec=2.0): return False
         s = Pose(); s.orientation.w = 1.0
@@ -126,23 +136,14 @@ class MotionBackend:
             req.ik_request.group_name = self.group_name
             req.ik_request.ik_link_name = "xarm5_link5"
             req.ik_request.avoid_collisions = True
-            
-            ik_pose = PoseStamped()
-            ik_pose.header.frame_id = 'world_world'
-            ik_pose.pose = target_pose.pose
-            ik_pose.pose.orientation = start_pose.pose.orientation
-            
-            req.ik_request.pose_stamped = ik_pose
-            req.ik_request.robot_state = self._get_full_robot_state()
-            
+            ik_pose = PoseStamped(); ik_pose.header.frame_id = 'world_world'
+            ik_pose.pose = target_pose.pose; ik_pose.pose.orientation = start_pose.pose.orientation
+            req.ik_request.pose_stamped = ik_pose; req.ik_request.robot_state = self._get_full_robot_state()
             res = self._call_ik_sync(req)
             if res.error_code.val == 1:
-                ik_solution = res.solution.joint_state
-                break
+                ik_solution = res.solution.joint_state; break
         
-        if not ik_solution:
-            self.node.get_logger().error("❌ IK Failed: Cannot reach bottom position.")
-            return False
+        if not ik_solution: return False
 
         goal_joints = {name: pos for name, pos in zip(ik_solution.name, ik_solution.position)}
         mg_goal = MoveGroup.Goal()
@@ -150,12 +151,10 @@ class MotionBackend:
         mg_goal.request.max_velocity_scaling_factor = velocity_scaling
         mg_goal.request.max_acceleration_scaling_factor = 0.05
         mg_goal.request.allowed_planning_time = 2.0
-        
         constraints = Constraints()
         for name, pos in goal_joints.items():
             if "xarm" in name:
-                jc = JointConstraint()
-                jc.joint_name = name; jc.position = pos; jc.weight = 1.0
+                jc = JointConstraint(); jc.joint_name = name; jc.position = pos; jc.weight = 1.0
                 jc.tolerance_above = 0.001; jc.tolerance_below = 0.001
                 constraints.joint_constraints.append(jc)
         mg_goal.request.goal_constraints.append(constraints)
@@ -170,42 +169,33 @@ class MotionBackend:
         
         if plan_result.error_code.val != 1: return False
 
-        goal = ExecuteTrajectory.Goal()
-        goal.trajectory = plan_result.planned_trajectory
+        goal = ExecuteTrajectory.Goal(); goal.trajectory = plan_result.planned_trajectory
         gf = self._execute_client.send_goal_async(goal)
         while not gf.done(): time.sleep(0.01)
         self._current_goal_handle = gf.result()
         rf = self._current_goal_handle.get_result_async()
         
-        start_t = time.time()
-        loop_cnt = 0
+        start_t = time.time(); loop_cnt = 0
         while not rf.done():
-            if (time.time() - start_t) > 0.5:
-                if check_force_callback():
-                    self.stop_immediately()
-                    return True
-            loop_cnt += 1
-            time.sleep(0.005) 
+            if (time.time() - start_t) > 0.5 and check_force_callback():
+                self.stop_immediately(); return True
+            loop_cnt += 1; time.sleep(0.005) 
         return True
 
     def move_to_pose_robust(self, x, y, z, q_dict, link_name, frame_id='world_world', velocity=0.1):
         req = GetPositionIK.Request()
         req.ik_request.group_name = self.group_name; req.ik_request.ik_link_name = link_name
         req.ik_request.avoid_collisions = True
-        
         target_pose = PoseStamped(); target_pose.header.frame_id = frame_id 
         target_pose.pose.position.x = x; target_pose.pose.position.y = y; target_pose.pose.position.z = z
         if q_dict:
             target_pose.pose.orientation = Quaternion(x=q_dict['qx'], y=q_dict['qy'], z=q_dict['qz'], w=q_dict['qw'])
-            req.ik_request.pose_stamped = target_pose
-            req.ik_request.robot_state = self._get_full_robot_state()
+            req.ik_request.pose_stamped = target_pose; req.ik_request.robot_state = self._get_full_robot_state()
             res = self._call_ik_sync(req)
             if res.error_code.val == 1: return self._process_ik_result(res, velocity, 0.1)
-        
         for yaw in [0.0, 0.4, -0.4, 0.8, -0.8, 1.57, -1.57, 3.14]:
             target_pose.pose.orientation = self._rpy_to_quaternion(math.pi, 0.0, yaw)
-            req.ik_request.pose_stamped = target_pose
-            req.ik_request.robot_state = self._get_full_robot_state()
+            req.ik_request.pose_stamped = target_pose; req.ik_request.robot_state = self._get_full_robot_state()
             res = self._call_ik_sync(req)
             if res.error_code.val == 1: return self._process_ik_result(res, velocity, 0.1)
         return False
@@ -239,65 +229,53 @@ class MotionBackend:
         return rf.result().result.error_code.val == 1
 
     # =========================================================================
-    # 👈 [NEW] DIRECT PYTHON SDK CARTESIAN CONTROLLERS
+    # ⚡ DIRECT PYTHON SDK CONTROLLERS (Position Mode 0)
     # =========================================================================
 
-    def move_linear_z_sdk_with_force_stop(self, distance_down_m, speed_mm_s, check_force_callback):
-        """Uses the direct Python SDK to drop strictly in Z relative to current position."""
-        if not hasattr(self, 'arm'):
-            self.node.get_logger().error("❌ SDK not connected!")
-            return False
+    def move_to_absolute_pose_sdk(self, x_m, y_m, z_m, speed_mm_s=50.0):
+        if not hasattr(self, 'arm'): return False
+        _, state = self.arm.get_state()
+        if state == 4:
+            self.node.get_logger().warn("⚠️ Clearing State 4 Error...")
+            self.arm.clean_error(); self.arm.motion_enable(enable=True); self.arm.set_mode(0); self.arm.set_state(state=0)
+            time.sleep(0.5)
 
-        # distance_down_m is expected to be a positive drop value in the main script
-        # We enforce it as a negative millimeter move for the Z descent
-        dz_mm = -abs(distance_down_m * 1000.0)
-
-        print(f"\n🔮 SDK DESCENT: Dropping {abs(dz_mm):.1f}mm at {speed_mm_s}mm/s")
-
-        # 1. Take absolute control of the hardware state
-        self.arm.set_mode(0)
-        self.arm.set_state(state=0)
-
-        # 2. Fire the non-blocking relative Cartesian command
-        self.arm.set_position(x=0, y=0, z=dz_mm, roll=0, pitch=0, yaw=0, 
-                              speed=speed_mm_s, relative=True, wait=False)
-
-        start_t = time.time()
-        time.sleep(0.1) # Brief buffer to allow hardware state to flip to 'moving'
+        x_mm = x_m * 1000.0; y_mm = y_m * 1000.0; z_mm = z_m * 1000.0
+        self.arm.set_mode(0); self.arm.set_state(state=0)
         
-        # 3. Asynchronous Guarded Polling Loop
+        code, curr_pos = self.arm.get_position(is_radian=False)
+        if code != 0 or not curr_pos: return False
+        curr_r, curr_p, curr_y = curr_pos[3], curr_pos[4], curr_pos[5]
+
+        print(f"   🌊 SDK ABS MOVE -> X:{x_mm:.1f} Y:{y_mm:.1f} Z:{z_mm:.1f} (R:{curr_r:.1f} P:{curr_p:.1f} Y:{curr_y:.1f})")
+        ret = self.arm.set_position(x=x_mm, y=y_mm, z=z_mm, roll=curr_r, pitch=curr_p, yaw=curr_y, speed=speed_mm_s, relative=False, wait=True)
+        return ret == 0
+
+    def move_linear_z_sdk_with_force_stop(self, distance_down_m, speed_mm_s, check_force_callback):
+        if not hasattr(self, 'arm'): return False
+        _, state = self.arm.get_state()
+        if state == 4:
+            self.arm.clean_error(); self.arm.motion_enable(enable=True); self.arm.set_mode(0); self.arm.set_state(state=0)
+
+        dz_mm = -abs(distance_down_m * 1000.0)
+        self.arm.set_mode(0); self.arm.set_state(state=0)
+        self.arm.set_position(x=0, y=0, z=dz_mm, roll=0, pitch=0, yaw=0, speed=speed_mm_s, relative=True, wait=False)
+        start_t = time.time(); time.sleep(0.1)
         while rclpy.ok():
-            # Code 1 means the arm is actively moving
             _, state = self.arm.get_state()
-            if state != 1: 
-                break
-
-            # Grace period to ignore initial acceleration spikes
-            if (time.time() - start_t) > 0.5:
-                if check_force_callback():
-                    self.arm.set_state(state=4) # Instant Hardware Brake
-                    self.stop_immediately()
-                    self.node.get_logger().info("🛑 Force limit hit! Hardware stop executed.")
-                    return True
-                    
+            if state != 1: break
+            if (time.time() - start_t) > 0.5 and check_force_callback():
+                self.arm.set_state(state=4); self.stop_immediately(); return True
             time.sleep(0.005) 
-
-        print("✅ Reached target Z without collision.")
         return True
 
     def jog_cartesian_sdk(self, dx_m, dy_m, dz_m, speed_mm_s=20.0):
-        """Uses the direct Python SDK to step exactly X/Y/Z millimeters and block until finished."""
-        if not hasattr(self, 'arm'):
-            self.node.get_logger().error("❌ SDK not connected!")
-            return False
+        if not hasattr(self, 'arm'): return False
+        _, state = self.arm.get_state()
+        if state == 4:
+            self.arm.clean_error(); self.arm.motion_enable(enable=True); self.arm.set_mode(0); self.arm.set_state(state=0)
 
-        dx_mm = dx_m * 1000.0
-        dy_mm = dy_m * 1000.0
-        dz_mm = dz_m * 1000.0
-
-        self.arm.set_mode(0)
-        self.arm.set_state(state=0)
-
-        code = self.arm.set_position(x=dx_mm, y=dy_mm, z=dz_mm, roll=0, pitch=0, yaw=0, 
-                                     speed=speed_mm_s, relative=True, wait=True)
+        dx_mm = dx_m * 1000.0; dy_mm = dy_m * 1000.0; dz_mm = dz_m * 1000.0
+        self.arm.set_mode(0); self.arm.set_state(state=0)
+        code = self.arm.set_position(x=dx_mm, y=dy_mm, z=dz_mm, roll=0, pitch=0, yaw=0, speed=speed_mm_s, relative=True, wait=True)
         return code == 0
