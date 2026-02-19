@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+"""
+Motion Backend Module
+Provides a unified control interface for xArm/UF850 robotic arms.
+It utilizes a hybrid approach:
+1. ROS 2 MoveIt! for complex kinematics, path planning, and obstacle avoidance.
+2. Native Python SDK (xArmAPI) for rapid cartesian jogging and high-frequency force-stop reactions.
+"""
+
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
@@ -15,16 +23,22 @@ import time
 import copy 
 import std_srvs.srv
 
-# Use the native Python SDK directly
+# Use the native Python SDK directly for real-time control bypassing ROS
 from xarm.wrapper import XArmAPI
 
 # ==========================================
 # DYNAMIC SDK IPs
-XARM_IP = '192.168.1.239' 
-UF850_IP = '192.168.1.195'
+# Configuration for the physical hardware endpoints.
+# ==========================================
+XARM_IP = '192.168.1.239'   # Tool Arm (xarm5)
+UF850_IP = '192.168.1.195'  # Manipulation Arm (uf850/gripper)
 # ==========================================
 
 class MotionBackend:
+    """
+    Acts as the middle layer between high-level agent skills and low-level robot hardware.
+    Handles TF transformations, joint state tracking, and executes motion commands.
+    """
     def __init__(self, node: Node, group_name: str):
         self.node = node
         self.group_name = group_name
@@ -38,7 +52,7 @@ class MotionBackend:
         self._reset_srv = self.node.create_client(std_srvs.srv.Empty, '/xarm/reset_robot')
         
         # --- Direct Hardware Connection (SDK) ---
-        # Dynamically assign the correct IP based on the MoveIt group
+        # Dynamically assign the correct IP based on the MoveIt group requested by the skill
         target_ip = None
         if "uf" in self.group_name.lower():
             target_ip = UF850_IP
@@ -54,6 +68,7 @@ class MotionBackend:
                 self.arm.set_state(state=0)
                 
                 # [CRITICAL FIX] Force Controller to ignore internal TCP offset
+                # Ensures MoveIt and the SDK share the exact same coordinate frame origin
                 self.arm.set_tcp_offset([0, 0, 0, 0, 0, 0])
                 self.node.get_logger().info(f"✅ Native SDK Connected ({target_ip}) & TCP Offset Cleared!")
                 
@@ -62,29 +77,36 @@ class MotionBackend:
         else:
             self.node.get_logger().info(f"⏭️ No SDK connection needed for group '{self.group_name}'.")
 
+        # --- Internal State Tracking ---
         self._current_goal_handle = None
         self.current_joint_msg = None
         self.current_joint_positions = {}
-        # NEW: Effort storage for contact sensing
-        self.current_joint_efforts = {}
+        self.current_joint_efforts = {}       # Stores live torque values for tactile feedback
         self.state_received = threading.Event()
         
-        # Subscribers & TF
+        # --- Subscribers & TF ---
         self.joint_sub = self.node.create_subscription(JointState, '/joint_states', self._joint_state_callback, 10)
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self.node)
 
     def _joint_state_callback(self, msg):
-        """Updated to extract both position and effort data."""
+        """
+        Continuously updates the internal dictionary of joint positions and efforts.
+        Used to monitor torque spikes during tactile descent.
+        """
         self.current_joint_msg = msg
         for i, name in enumerate(msg.name):
             self.current_joint_positions[name] = msg.position[i]
-            # Capture effort spikes for tactile feedback
+            # Capture effort spikes for tactile feedback (if hardware publishes it)
             if len(msg.effort) > i:
                 self.current_joint_efforts[name] = msg.effort[i]
         self.state_received.set()
 
     def _get_full_robot_state(self):
+        """
+        Constructs a MoveIt RobotState message from current joint readings.
+        Required for accurate Inverse Kinematics calculations.
+        """
         state = RobotState()
         js = JointState()
         js.header.stamp = self.node.get_clock().now().to_msg()
@@ -94,13 +116,18 @@ class MotionBackend:
         return state
 
     def _rpy_to_quaternion(self, roll, pitch, yaw):
+        """
+        Converts Euler angles (Roll, Pitch, Yaw in radians) to a ROS Quaternion.
+        """
         cy, sy = math.cos(yaw * 0.5), math.sin(yaw * 0.5)
         cp, sp = math.cos(pitch * 0.5), math.sin(pitch * 0.5)
         cr, sr = math.cos(roll * 0.5), math.sin(roll * 0.5)
         return Quaternion(w=cr*cp*cy + sr*sp*sy, x=sr*cp*cy - cr*sp*sy, y=cr*sp*cy + sr*cp*sy, z=cr*cp*sy - sr*sp*cy)
 
     def reset_robot(self):
-        """Resets errors on both hardware SDK and ROS driver side."""
+        """
+        Clears hardware safety faults and ROS driver errors, re-enabling motion.
+        """
         if hasattr(self, 'arm'):
             self.arm.clean_error()
             self.arm.motion_enable(enable=True)
@@ -113,7 +140,10 @@ class MotionBackend:
             self.node.get_logger().info("✅ Robot Reset & Enabled")
 
     def stop_immediately(self):
-        """Triggers emergency stop on hardware and cancels ROS goals."""
+        """
+        Triggers an emergency stop by immediately sending a State 4 to the hardware
+        and canceling any active MoveIt ROS goals.
+        """
         if self._current_goal_handle: self._current_goal_handle.cancel_goal_async()
         if hasattr(self, 'arm'):
             self.arm.set_state(state=4) 
@@ -122,6 +152,10 @@ class MotionBackend:
             self.node.get_logger().error("!!! HARDWARE STOP SENT !!!")
 
     def get_transformed_pose(self, source_pose, source_frame: str, target_frame: str, z_offset=0.0):
+        """
+        Transforms a pose from one TF frame to another.
+        Typically used to convert camera coordinates to world coordinates.
+        """
         try:
             import tf2_geometry_msgs 
             real_pose = source_pose.pose if hasattr(source_pose, 'pose') else source_pose
@@ -136,8 +170,16 @@ class MotionBackend:
             self.node.get_logger().error(f"TF Error: {e}")
             return None
 
-    # --- INTACT MOVEIT 2 FUNCTIONS ---
+    # =========================================================================
+    # INTACT MOVEIT 2 FUNCTIONS (Path Planning & Collision Avoidance)
+    # =========================================================================
+
     def move_linear_z_with_force_stop(self, distance_down, velocity_scaling, check_force_callback):
+        """
+        Uses MoveIt to plan a straight linear downward path. While executing, it evaluates 
+        check_force_callback() at a high frequency. If the callback returns True, the 
+        arm stops instantly.
+        """
         if not self._execute_client.wait_for_server(timeout_sec=2.0): return False
         s = Pose(); s.orientation.w = 1.0
         start_pose = self.get_transformed_pose(s, 'xarm5_link5', 'world_world') 
@@ -147,6 +189,7 @@ class MotionBackend:
         target_pose.pose.position.z -= abs(distance_down) 
 
         ik_solution = None
+        # Try finding an IK solution with slight yaw variations if a direct path is unfeasible
         for yaw_offset in [0.0, 0.1, -0.1, 0.2, -0.2]:
             req = GetPositionIK.Request()
             req.ik_request.group_name = self.group_name
@@ -167,6 +210,7 @@ class MotionBackend:
         mg_goal.request.max_velocity_scaling_factor = velocity_scaling
         mg_goal.request.max_acceleration_scaling_factor = 0.05
         mg_goal.request.allowed_planning_time = 2.0
+        
         constraints = Constraints()
         for name, pos in goal_joints.items():
             if "xarm" in name:
@@ -199,16 +243,23 @@ class MotionBackend:
         return True
 
     def move_to_pose_robust(self, x, y, z, q_dict, link_name, frame_id='world_world', velocity=0.1):
+        """
+        Attempts to compute IK for a target cartesian coordinate using MoveIt. 
+        If it fails, it intelligently spins the end-effector yaw to find a valid kinematic solution.
+        """
         req = GetPositionIK.Request()
         req.ik_request.group_name = self.group_name; req.ik_request.ik_link_name = link_name
         req.ik_request.avoid_collisions = True
         target_pose = PoseStamped(); target_pose.header.frame_id = frame_id 
         target_pose.pose.position.x = x; target_pose.pose.position.y = y; target_pose.pose.position.z = z
+        
         if q_dict:
             target_pose.pose.orientation = Quaternion(x=q_dict['qx'], y=q_dict['qy'], z=q_dict['qz'], w=q_dict['qw'])
             req.ik_request.pose_stamped = target_pose; req.ik_request.robot_state = self._get_full_robot_state()
             res = self._call_ik_sync(req)
             if res.error_code.val == 1: return self._process_ik_result(res, velocity, 0.1)
+            
+        # Fallback: Try multiple yaw orientations if a specific quaternion isn't strictly required
         for yaw in [0.0, 0.4, -0.4, 0.8, -0.8, 1.57, -1.57, 3.14]:
             target_pose.pose.orientation = self._rpy_to_quaternion(math.pi, 0.0, yaw)
             req.ik_request.pose_stamped = target_pose; req.ik_request.robot_state = self._get_full_robot_state()
@@ -217,16 +268,22 @@ class MotionBackend:
         return False
 
     def _call_ik_sync(self, req):
+        """Synchronous wrapper to wait for the MoveIt Inverse Kinematics service to reply."""
         future = self._ik_client.call_async(req)
         while not future.done(): time.sleep(0.01)
         return future.result()
 
     def _process_ik_result(self, response, velocity, acceleration):
+        """Extracts the joint state from a successful IK response and commands the arm to move."""
         ik_joints = {name: pos for name, pos in zip(response.solution.joint_state.name, response.solution.joint_state.position)}
         prefix = "xarm5" if "xarm" in self.group_name else "u1"
         return self.move_to_joint_positions(ik_joints, filter_prefix=prefix, velocity=velocity)
 
     def move_to_joint_positions(self, target_joints, filter_prefix="", velocity=0.1):
+        """
+        Uses MoveIt to safely plan and execute a trajectory to specific joint angles.
+        Filters joints by prefix to prevent sending commands to the wrong arm/gripper.
+        """
         if not self.state_received.wait(2.0): return False
         goal = MoveGroup.Goal(); goal.request.group_name = self.group_name
         goal.request.max_velocity_scaling_factor = velocity
@@ -244,9 +301,17 @@ class MotionBackend:
         while not rf.done(): time.sleep(0.1)
         return rf.result().result.error_code.val == 1
 
-    # --- DIRECT PYTHON SDK CONTROLLERS (Position Mode 0) ---
+
+    # =========================================================================
+    # DIRECT PYTHON SDK CONTROLLERS (Position Mode 0)
+    # Bypasses ROS for rapid, collision-blind micro-adjustments
+    # =========================================================================
 
     def move_to_absolute_pose_sdk(self, x_m, y_m, z_m, speed_mm_s=50.0):
+        """
+        Commands the hardware directly to move to an absolute cartesian point.
+        Converts inputs from meters to millimeters for the SDK. Maintains current orientation.
+        """
         if not hasattr(self, 'arm'): return False
         _, state = self.arm.get_state()
         if state == 4:
@@ -266,6 +331,11 @@ class MotionBackend:
         return ret == 0
 
     def move_linear_z_sdk_with_force_stop(self, distance_down_m, speed_mm_s, check_force_callback):
+        """
+        High-frequency tactile descent.
+        Sends an asynchronous relative Z command to the SDK, then rapidly polls the callback.
+        Throws a hardware State 4 error to brake the robot instantly upon contact.
+        """
         if not hasattr(self, 'arm'): return False
         _, state = self.arm.get_state()
         if state == 4:
@@ -275,15 +345,20 @@ class MotionBackend:
         self.arm.set_mode(0); self.arm.set_state(state=0)
         self.arm.set_position(x=0, y=0, z=dz_mm, roll=0, pitch=0, yaw=0, speed=speed_mm_s, relative=True, wait=False)
         start_t = time.time(); time.sleep(0.1)
+        
         while rclpy.ok():
             _, state = self.arm.get_state()
-            if state != 1: break
+            if state != 1: break # Stopped moving
             if (time.time() - start_t) > 0.5 and check_force_callback():
                 self.arm.set_state(state=4); self.stop_immediately(); return True
             time.sleep(0.005) 
         return True
 
     def jog_cartesian_sdk(self, dx_m, dy_m, dz_m, speed_mm_s=20.0):
+        """
+        Commands the hardware directly to move a relative distance from its current position.
+        Converts inputs from meters to millimeters. Blocks until the movement is finished.
+        """
         if not hasattr(self, 'arm'): return False
         _, state = self.arm.get_state()
         if state == 4:

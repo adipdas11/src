@@ -2,7 +2,7 @@
 import rclpy
 from rclpy.node import Node
 from rclpy.executors import MultiThreadedExecutor
-from std_msgs.msg import Bool
+from std_msgs.msg import String, Bool
 import threading
 import math
 import time
@@ -11,40 +11,71 @@ import time
 from disassembly_skills.motion_backend import MotionBackend
 
 class ObjectFlipSkill(Node):
+    """
+    ROS 2 Node responsible for flipping an object that is currently held by the robot.
+    It lifts the object, rotates the wrist joint alternatingly (+180/-180 degrees) to 
+    prevent cable wind-up, lowers it using tactile feedback until it touches the table, 
+    releases it to settle, and re-grasps it.
+    """
     def __init__(self):
         super().__init__('object_flip_skill_node')
         
-        # 1. Backends
+        # --- Hardware Backends ---
         self.uf850 = MotionBackend(self, "uf_arm")
         self.gripper = MotionBackend(self, "rg6_gripper")
         
-        # 2. Hold Status Subscriber (Used only for standalone trigger)
+        # --- Subscriptions & Synchronization ---
+        # Used only for standalone trigger to ensure an object is held before flipping
         self.is_holding_object = False
         self.last_logged_status = None  
         self.hold_event = threading.Event()
         self.create_subscription(Bool, '/object_hold_status', self.hold_status_callback, 10)
         
+        # --- Publishers ---
+        self.state_update_pub = self.create_publisher(String, '/robot_state/manip_arm/update', 10)
+        
         self.get_logger().info("🚀 Object Flip Skill Node Active.")
 
-        # ================= CONFIGURATION =================
-        self.PLANNING_FRAME = 'world_world'    
-        self.ROBOT_EE_LINK = "u1_tool0"
+        # =====================================================================
+        # CONFIGURATION & PARAMETERS
+        # =====================================================================
         
-        self.JOINT_GRIPPER = "rg6_l_out"
-        self.OPEN_DEG = 35.0
-        self.CLOSE_DEG = -35.0 
-        self.GRIPPER_SPEED = 0.3
+        # --- Frames & Geometry ---
+        self.PLANNING_FRAME = 'world_world'    # Base coordinate frame for TF operations
+        self.ROBOT_EE_LINK = "u1_tool0"        # End-effector link name for the manipulator arm
+        
+        # --- Gripper Configuration ---
+        self.JOINT_GRIPPER = "rg6_l_out"       # Joint name controlling the gripper jaws
+        self.OPEN_DEG = 35.0                   # Angle (degrees) to fully open the jaws
+        self.CLOSE_DEG = -35.0                 # Angle (degrees) to fully close/clamp the jaws
+        self.GRIPPER_SPEED = 0.3               # Velocity multiplier for gripper actuation
+        
+        # --- Flip Motion Parameters ---
+        self.RETRACT_Z_HEIGHT = 0.15           # Distance (meters) to lift the object before rotating (15cm)
+        
+        # --- Tactile Feedback Configuration ---
+        self.CONTACT_JOINT = "u1_joint5"       # Joint monitored for torque spikes to detect table contact
+        self.TORQUE_THRESHOLD = 1.0            # Torque threshold (Nm) that registers as physical contact
+        self.RETRACT_DISTANCE = 0.005          # Distance (meters) to lift up after hitting the table (5mm)
+        # =====================================================================
 
-        self.RETRACT_Z_HEIGHT = 0.15   # 15cm Retract
-        
-        # --- TACTILE CONFIGURATION ---
-        self.CONTACT_JOINT = "u1_joint5"
-        self.TORQUE_THRESHOLD = 1.0    
-        self.RETRACT_DISTANCE = 0.005  # 5mm Retract for the drop
-        # =================================================
+    # -------------------------------------------------------------------------
+    # Helper & Communication Functions
+    # -------------------------------------------------------------------------
+    def publish_state(self, state_str: str):
+        """
+        Publishes the current operational state of the manipulator arm to the central State Manager.
+        """
+        msg = String()
+        msg.data = state_str
+        self.state_update_pub.publish(msg)
+        self.get_logger().info(f"🔄 State Manager Update -> {state_str}")
 
     def hold_status_callback(self, msg):
-        """Triggers the event on ANY status update, but only logs on changes."""
+        """
+        Listens to the /object_hold_status topic. Triggers the threading event 
+        so the standalone block knows when it is safe to execute the flip.
+        """
         self.is_holding_object = msg.data
         
         if self.last_logged_status != self.is_holding_object:
@@ -57,6 +88,10 @@ class ObjectFlipSkill(Node):
         self.hold_event.set() 
 
     def get_current_tcp_pose(self):
+        """
+        Looks up the current physical pose (Position and Quaternion) of the robot's end-effector.
+        Returns ((x, y, z), (qx, qy, qz, qw)) or (None, None) if the lookup fails.
+        """
         try:
             if self.uf850.tf_buffer.can_transform(self.PLANNING_FRAME, self.ROBOT_EE_LINK, rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=2.0)):
                 t = self.uf850.tf_buffer.lookup_transform(self.PLANNING_FRAME, self.ROBOT_EE_LINK, rclpy.time.Time())
@@ -68,13 +103,22 @@ class ObjectFlipSkill(Node):
             self.get_logger().error(f"TF Lookup Error: {e}")
             return None, None
 
+    # -------------------------------------------------------------------------
+    # Core Hardware Interaction Functions
+    # -------------------------------------------------------------------------
     def wait_for_gripper(self, target_deg, timeout=5.0):
+        """
+        Monitors the gripper's joint position and blocks until it either reaches 
+        the target angle or physically stalls (indicating it grasped the object).
+        """
         target_rad = math.radians(target_deg)
         start_time = time.time()
         while rclpy.ok() and (time.time() - start_time) < timeout:
             current_pos = self.gripper.current_joint_positions.get(self.JOINT_GRIPPER, 999)
             if current_pos == 999:
                 time.sleep(0.1); continue
+            
+            # Exact angle reached
             if abs(current_pos - target_rad) < 0.05: return True
             
             # Stall detection for re-grasping
@@ -96,11 +140,18 @@ class ObjectFlipSkill(Node):
         return False
 
     def descend_until_contact(self):
+        """
+        Performs a downward SDK linear movement while monitoring joint torque.
+        Stops the robot immediately when the torque spike exceeds TORQUE_THRESHOLD,
+        clears the generated collision error, and retracts slightly to un-pin the object.
+        """
+        self.publish_state("MOVING") # STATE UPDATE
         self.get_logger().info(f"⬇️ Starting Native SDK Tactile Descent (Target Joint: {self.CONTACT_JOINT})")
         self.contact_detected = False
         last_print_time = time.time()
 
         def check_force():
+            # Evaluated continuously during the SDK move block
             nonlocal last_print_time
             effort = self.uf850.current_joint_efforts.get(self.CONTACT_JOINT, -99.0)
             
@@ -114,6 +165,7 @@ class ObjectFlipSkill(Node):
                 return True 
             return False
 
+        # Execute descent
         self.uf850.move_linear_z_sdk_with_force_stop(
             distance_down_m=0.25, 
             speed_mm_s=10.0, 
@@ -122,6 +174,7 @@ class ObjectFlipSkill(Node):
 
         if not self.contact_detected:
             self.get_logger().error("❌ Max descent reached without sensing contact.")
+            self.publish_state("ERROR") # STATE UPDATE
             self.uf850.reset_robot() 
             return False
 
@@ -129,20 +182,25 @@ class ObjectFlipSkill(Node):
         self.uf850.reset_robot()
         time.sleep(0.5)
 
+        # Retract to avoid pressing the object into the table when opening the jaws
         self.get_logger().info(f"⬆️ Attempting SDK Retraction: {self.RETRACT_DISTANCE*1000}mm UP...")
         success = self.uf850.jog_cartesian_sdk(dx_m=0.0, dy_m=0.0, dz_m=self.RETRACT_DISTANCE, speed_mm_s=20.0)
         
         if not success:
             self.get_logger().error("❌ SDK Retraction command failed to execute.")
+            self.publish_state("ERROR") # STATE UPDATE
             return False
 
         time.sleep(0.5)
         return True
 
+    # -------------------------------------------------------------------------
+    # Core Sequence Execution
+    # -------------------------------------------------------------------------
     def execute_flip(self, interactive=False):
         """
-        Pure motion logic. Can be called directly as a library function.
-        Defaults to interactive=False for automated script execution.
+        Main state machine for the flip operation. 
+        Sequence: Lift -> Unwind/Wind Joint 6 (180deg) -> Tactile Descent -> Open Jaws -> Re-grasp.
         """
         print("\n" + "!"*60)
         print("🤖 INITIATING FLIP SKILL")
@@ -151,45 +209,62 @@ class ObjectFlipSkill(Node):
         pos, quat = self.get_current_tcp_pose()
         if not pos or not quat:
             self.get_logger().error("❌ Failed to get current TCP pose.")
+            self.publish_state("ERROR") # STATE UPDATE
             return False
 
         q_dict_current = {'qx': quat[0], 'qy': quat[1], 'qz': quat[2], 'qw': quat[3]}
         retract_z = pos[2] + self.RETRACT_Z_HEIGHT
 
         # --- STEP 1: Retract ---
+        self.publish_state("MOVING") # STATE UPDATE
         if interactive: input(f"\n🚀 STEP 1: Retract {self.RETRACT_Z_HEIGHT*100}cm in Z-Axis? [Enter]")
         self.uf850.move_to_pose_robust(
             pos[0], pos[1], retract_z, q_dict_current, 
-            link_name=self.ROBOT_EE_LINK, velocity=0.1, frame_id=self.PLANNING_FRAME
+            link_name=self.ROBOT_EE_LINK, velocity=0.07, frame_id=self.PLANNING_FRAME
         )
 
-        # --- STEP 2: Flip ---
+        # --- STEP 2: Flip (Alternating Logic) ---
+        self.publish_state("FLIPPING") # STATE UPDATE
         if interactive: input(f"\n🚀 STEP 2: Rotate u1_joint6 180° to flip object? [Enter]")
-        self.get_logger().info("🔄 Flipping object upside down by directly rotating u1_joint6...")
         
         current_joints = self.uf850.current_joint_positions.copy()
         if "u1_joint6" not in current_joints:
             self.get_logger().error("❌ Could not read current state of u1_joint6!")
+            self.publish_state("ERROR") # STATE UPDATE
             return False
             
-        current_joints["u1_joint6"] += math.pi
+        current_j6 = current_joints["u1_joint6"]
+        
+        # If already rotated positively past 90 degrees, subtract 180 degrees to unwind
+        if current_j6 > (math.pi / 2.0):
+            self.get_logger().info(f"🔄 Flipping backward (-180°) to unwind joint 6 (Current: {math.degrees(current_j6):.1f}°)...")
+            current_joints["u1_joint6"] -= math.pi
+        # Otherwise, add 180 degrees
+        else:
+            self.get_logger().info(f"🔄 Flipping forward (+180°) on joint 6 (Current: {math.degrees(current_j6):.1f}°)...")
+            current_joints["u1_joint6"] += math.pi
+            
         self.uf850.move_to_joint_positions(current_joints, filter_prefix="u1", velocity=0.1)
 
         # --- STEP 3: Descent ---
         if interactive: input(f"\n🚀 STEP 3: Start SDK Tactile Descent? [Enter]")
+        # Note: descend_until_contact() internally sets "MOVING" and "ERROR" if it fails.
         if not self.descend_until_contact(): 
             return False
 
         # --- STEP 4: Open Gripper ---
+        self.publish_state("MOVING") # STATE UPDATE (Gripper actuation)
         if interactive: input(f"\n🚀 STEP 4: Open Gripper to Release Object? [Enter]")
         self.get_logger().info("👐 Opening jaws to rest object on surface...")
         self.gripper.move_to_joint_positions({self.JOINT_GRIPPER: math.radians(self.OPEN_DEG)}, "rg6", velocity=self.GRIPPER_SPEED)
         self.wait_for_gripper(self.OPEN_DEG)
         
         # Give the object half a second to settle perfectly flat
+        self.publish_state("IDLE") # STATE UPDATE (Object is free on the table)
         time.sleep(0.5)
 
         # --- STEP 5: Close Gripper (Re-grasp) ---
+        self.publish_state("MOVING") # STATE UPDATE (Gripper actuation)
         if interactive: input(f"\n🚀 STEP 5: Close Gripper to Re-grasp Object? [Enter]")
         self.get_logger().info("✊ Closing jaws to re-grasp flipped object...")
         self.gripper.move_to_joint_positions({self.JOINT_GRIPPER: math.radians(self.CLOSE_DEG)}, "rg6", velocity=self.GRIPPER_SPEED)
@@ -197,47 +272,50 @@ class ObjectFlipSkill(Node):
         
         if not is_held:
             self.get_logger().error("❌ Failed to re-grasp the object after flipping.")
+            self.publish_state("ERROR") # STATE UPDATE
             return False
 
         print("\n🎉 FLIP SKILL COMPLETE: Object successfully flipped and re-grasped.")
+        self.publish_state("HOLDING") # STATE UPDATE
         return True
 
 
 # =====================================================================
-# STANDALONE EXECUTION BLOCK (Event-Driven)
+# STANDALONE EXECUTION BLOCK (One-Shot)
 # =====================================================================
 def main(args=None):
     rclpy.init(args=args)
     flip_node = ObjectFlipSkill()
     executor = MultiThreadedExecutor()
     executor.add_node(flip_node)
+    
+    # Spin the node in a background thread to allow callbacks to process
     spin_thread = threading.Thread(target=executor.spin, daemon=True)
     spin_thread.start()
     
     try:
-        # Standalone Event Loop
-        while rclpy.ok():
-            print("\n" + "="*60)
-            print("🕒 Waiting for Hold Skill to finish (/object_hold_status update)...")
-            print("="*60)
-            
-            flip_node.hold_event.clear()
-            flip_node.hold_event.wait() 
-            
-            if flip_node.is_holding_object:
-                # Trigger the function interactively for manual stepping in standalone mode
-                flip_node.execute_flip(interactive=True)
-                
-                # Reset status to wait for the next cycle
-                flip_node.is_holding_object = False 
+        print("\n" + "="*60)
+        print("🕒 Waiting for Hold Skill to finish (/object_hold_status update)...")
+        print("="*60)
+        
+        # Block until the hold_event is triggered by the subscriber
+        flip_node.hold_event.clear()
+        flip_node.hold_event.wait() 
+        
+        if flip_node.is_holding_object:
+            # Execute exactly once
+            success = flip_node.execute_flip(interactive=True)
+            if success:
+                print("✅ Object successfully flipped and secured. Exiting Node.")
             else:
-                flip_node.get_logger().error("❌ Cannot execute flip. The object was not securely held.")
-                
-            time.sleep(1.0) 
+                print("❌ Flip sequence failed. Exiting Node.")
+        else:
+            flip_node.get_logger().error("❌ Cannot execute flip. The object was not securely held.")
             
     except KeyboardInterrupt: 
         pass
         
+    # Shutdown gracefully after the single execution
     flip_node.destroy_node()
     rclpy.shutdown()
 

@@ -1,55 +1,32 @@
 #!/usr/bin/env python3
 
-# -----------------------------------------------------------------------------
-# Script entrypoint - Python 3.10.6
-# -----------------------------------------------------------------------------
 import os
 import asyncio
 import inspect
 import re
 import ast
-import time
+import threading
 from typing import List, Tuple, Optional, Dict, Any
-from langgraph.graph import StateGraph, END
 
-from disassembly_skills.disassembly_skills.unscrew_skill import UnscrewSkill
-from disassembly_skills.disassembly_skills.object_hold_skill import ObjectHoldSkill
-# -----------------------------------------------------------------------------
-# OpenAI (remote) — async client
-# -----------------------------------------------------------------------------
+# ROS 2 Imports
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import String
+from ament_index_python.packages import get_package_share_directory
+
+# LangGraph & OpenAI
+from langgraph.graph import StateGraph, END
 from openai import AsyncOpenAI, OpenAIError
 
-DEBUG_FULL_OUTPUT = False
-
-# Load API key from local file
-API_KEY_FILE = "api_key.txt"
-try:
-    with open(API_KEY_FILE, "r") as f:
-        OPENAI_API_KEY = f.read().strip()
-except FileNotFoundError:
-    raise RuntimeError(f"Missing {API_KEY_FILE}. Please create it with your OpenAI API key.")
-
-# Choose model
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.1")
-
-# Create client with key from file
-oai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+# Local Skill Imports
+from disassembly_skills.unscrew_skill import UnscrewSkill
+from disassembly_skills.object_hold_skill import ObjectHoldSkill
 
 # -----------------------------------------------------------------------------
-# Tool Class + async tools
-# -----------------------------------------------------------------------------
-class Tool:
-    def __init__(self, fn, description: str, args: Optional[Dict[str, str]] = None):
-        self.fn = fn
-        self.description = description
-        self.args = args or {}
-
-# -----------------------------------------------------------------------------
-# Terminal color utilities
+# Terminal Color Utilities
 # -----------------------------------------------------------------------------
 class TColor:
     RESET = "\033[0m"
-
     REASONING   = "\033[38;5;244m"   # soft gray
     PLAN        = "\033[38;5;39m"    # blue
     ACTION      = "\033[38;5;214m"   # orange
@@ -58,401 +35,182 @@ class TColor:
     ERROR       = "\033[38;5;196m"   # red
 
 def print_stage(text: str):
-    if text.startswith("Reasoning:"):
-        color = TColor.REASONING
-    elif text.startswith("Plan:"):
-        color = TColor.PLAN
-    elif text.startswith("Action:"):
-        color = TColor.ACTION
-    elif text.startswith("Observation:"):
-        color = TColor.OBSERVATION
-    elif text.startswith("Final Answer:"):
-        color = TColor.FINAL
-    else:
-        color = TColor.ERROR
-
+    prefix_map = {
+        "Reasoning:": TColor.REASONING,
+        "Plan:": TColor.PLAN,
+        "Action:": TColor.ACTION,
+        "Observation:": TColor.OBSERVATION,
+        "Final Answer:": TColor.FINAL
+    }
+    color = TColor.ERROR
+    for prefix, c in prefix_map.items():
+        if text.startswith(prefix):
+            color = c
+            break
     print(color + text + TColor.RESET, flush=True)
 
 # -----------------------------------------------------------------------------
-# Tools
+# Master Agent Node
 # -----------------------------------------------------------------------------
-async def dummy(dumvar=100):
-    return "Tool called successfully"
+class MasterAgentNode(Node):
+    def __init__(self):
+        super().__init__('master_agent')
+        
+        # 1. Threading Setup: Create a dedicated thread for Asyncio LLM calls
+        self.loop = asyncio.new_event_loop()
+        self.loop_thread = threading.Thread(target=self._run_async_loop, daemon=True)
+        self.loop_thread.start()
+        
+        # 2. Resolve API Key Path
+        try:
+            # Using absolute path as requested in your logs
+            api_key_path = "/home/adip/workspaces/disassembly_ws/src/disassembly_skills/config/api_key.txt"
+            with open(api_key_path, "r") as f:
+                api_key = f.read().strip()
+        except Exception as e:
+            self.get_logger().error(f"Could not load API key from {api_key_path}: {e}")
+            raise RuntimeError("API Key Missing.")
 
-async def unscrew(unscrew_id= None, unscrew_label = None, hold_id = None, hold_label = None):
-    if None in (unscrew_id, unscrew_label, hold_id, hold_label):
-        return "Action failed, missing required parameter"
-    else:
-        unscrew = UnscrewSkill()
-        hold = ObjectHoldSkill()
+        # 3. Setup OpenAI Client
+        self.model_name = os.getenv("OPENAI_MODEL", "gpt-4-turbo")
+        self.oai_client = AsyncOpenAI(api_key=api_key)
 
-        hold.execute_hold(part_id=hold_id, target_label=hold_label)
-        unscrew.execute_unscrew_command(target_id = unscrew_id, target_label=unscrew_label)
+        # 4. Instantiate Sub-Skill Nodes
+        self.unscrew_skill = UnscrewSkill()
+        self.hold_skill = ObjectHoldSkill()
 
-    return "Tool called successfully"
+        # 5. Define Agent Tools
+        self.tools = {
+            "unscrew": {
+                "fn": self.unscrew_wrapper,
+                "desc": "Unscrews a part. Requires hold_id, unscrew_id, and labels.",
+                "args": ["unscrew_id", "unscrew_label", "hold_id", "hold_label"]
+            },
+            "hold_object": {
+                "fn": self.hold_wrapper,
+                "desc": "Secures an object using the tactile hold skill.",
+                "args": ["part_id", "label"]
+            }
+        }
 
-async def lift_and_drop(object_id= None, object_name = None):
-    if object_id == None or object_name == None:
-        return "Action failed, missing object_id or object_name parameter"
-    else:
-        pass
+        # 6. ROS Interfaces
+        self.goal_sub = self.create_subscription(String, '/agent_goal', self.goal_callback, 10)
+        self.get_logger().info("🤖 Master Agent Ready. Send goals to /agent_goal")
+
+    def _run_async_loop(self):
+        """Internal worker for the dedicated asyncio thread."""
+        asyncio.set_event_loop(self.loop)
+        self.loop.run_forever()
+
+    # --- Tool Wrappers ---
+    async def hold_wrapper(self, part_id: int, label: str):
+        self.get_logger().info(f"🛠️ Executing Hold Skill on {label}...")
+        # Skill nodes run synchronously within this wrapper
+        success = self.hold_skill.execute_hold(part_id=int(part_id), target_label=label, interactive=False)
+        return "SUCCESS: Object secured" if success else "FAILURE: Could not hold object"
+
+    async def unscrew_wrapper(self, unscrew_id: int, unscrew_label: str, hold_id: int, hold_label: str):
+        self.get_logger().info(f"🛠️ Executing Unscrew Skill on {unscrew_label}...")
+        success = self.unscrew_skill.execute_unscrew_command(target_id=int(unscrew_id), target_label=unscrew_label, interactive=False)
+        return "SUCCESS: Screw removed and disposed" if success else "FAILURE: Unscrewing failed"
+
+    # --- ReAct Agent Core ---
+    def get_prompt_header(self):
+        tool_desc = "\n".join([f"- {k}({', '.join(v['args'])}): {v['desc']}" for k, v in self.tools.items()])
+        return (
+            f"You are a robotic disassembly agent. Tools:\n{tool_desc}\n\n"
+            "Format your response exactly as follows:\n"
+            "Reasoning: <thought process>\n"
+            "Plan: <short-term goal>\n"
+            "Action: tool_name(args)\n"
+            "Observation: <result will be provided>\n"
+            "... repeat until done ...\n"
+            "Final Answer: <summary of completion>"
+        )
+
+    async def call_llm(self, prompt, max_tokens=350):
+        try:
+            response = await self.oai_client.chat.completions.create(
+                model=self.model_name,
+                messages=[{"role": "system", "content": self.get_prompt_header()},
+                          {"role": "user", "content": prompt}],
+                max_tokens=max_tokens,
+                temperature=0
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            return f"Error: {e}"
+
+    # --- Agent Execution Loop ---
+    async def agent_loop(self, user_query):
+        self.get_logger().info(f"🧠 Reasoning about: {user_query}")
+        state = {"input": user_query, "history": []}
+        
+        for step in range(10): 
+            prompt = f"User Goal: {state['input']}\nHistory:\n" + "\n".join(state["history"]) + "\nNext Step:"
+            llm_out = await self.call_llm(prompt)
+            
+            # Process multi-line responses from LLM
+            lines = llm_out.splitlines()
+            for line in lines:
+                line = line.strip()
+                if not line: continue
+                
+                if line.startswith(("Reasoning:", "Plan:", "Action:", "Final Answer:")):
+                    print_stage(line)
+                    state["history"].append(line)
+
+            last_entry = state["history"][-1]
+            if "Final Answer:" in last_entry:
+                break
+            
+            if "Action:" in last_entry:
+                # Regex to extract: tool_name(arg1, arg2...)
+                match = re.search(r"Action:\s*(\w+)\((.*)\)", last_entry)
+                if match:
+                    t_name, t_args_raw = match.groups()
+                    # Clean arguments: remove quotes and whitespace
+                    t_args = [a.strip().strip("'").strip('"') for a in t_args_raw.split(",") if a.strip()]
+                    
+                    if t_name in self.tools:
+                        obs = await self.tools[t_name]["fn"](*t_args)
+                        obs_str = f"Observation: {obs}"
+                        print_stage(obs_str)
+                        state["history"].append(obs_str)
+                    else:
+                        error_msg = f"Observation: Tool {t_name} not found."
+                        print_stage(error_msg)
+                        state["history"].append(error_msg)
+
+    def goal_callback(self, msg):
+        self.get_logger().info(f"Received Topic Goal: {msg.data}")
+        # Run the agent_loop in the dedicated asyncio thread to avoid thread errors
+        asyncio.run_coroutine_threadsafe(self.agent_loop(msg.data), self.loop)
+
+# -----------------------------------------------------------------------------
+# Main Execution
+# -----------------------------------------------------------------------------
+def main(args=None):
+    rclpy.init(args=args)
     
-    return "Tool called successfully"
-
-tools: Dict[str, Tool] = {
-    "unscrew": Tool(
-        unscrew,
-        "Performs an unscrewing action. Requires the ID and label of the part to be unscrewed as well as the ID and label for another part to be held to keep the entire object secure during unscrewing",
-        args={"unscrew_id": "int: ID of the target screw",
-              "unscrew_label": "str: label of the target screw",
-              "hold_id": "int: ID of the holding target",
-              "hold_label": "str: label of the holding target"}
-    )
-}
-
-def format_tool_list() -> str:
-    lines = []
-    for name, tool in tools.items():
-        if tool.args:
-            args_str = ", ".join(f"{arg}: {desc}" for arg, desc in tool.args.items())
-            lines.append(f"- {name}({args_str}): {tool.description}")
-        else:
-            lines.append(f"- {name}(): {tool.description}")
-    return "\n".join(lines)
-
-# -----------------------------------------------------------------------------
-# Prompt builders
-# -----------------------------------------------------------------------------
-FORBIDDEN_HEADERS = ("Plan:", "Action:", "Observation:", "Final Answer:")
-
-def build_think_prompt(user_input: str, history: List[str]) -> str:
-    tool_list = format_tool_list()
-    guide = "\n".join([
-        "You are a part of a ReAct agent. Your role is to produce a reasoning stage to reason about the problem and guide the following Plan, Action and Observation stages that will be handled by the rest of the agent.",
-        "This stage is a TRANSPARENT scratchpad that will be shown to the user.",
-        "",
-        "Rules:",
-        "- Output MUST start with: Reasoning:",
-        "- You may write multiple lines after 'Reasoning:'.",
-        "- Do NOT output Plan:, Action:, Observation:, or Final Answer: in this stage.",
-        "- Do NOT refer to your role in the output. only produce relevant reasoning that can be used by the other parts of the agent"
-        "- Be concrete: if applicable, summarise the previous plan> action> observation within the context of the user query and create a short generation to support the next planning stage",
-        "",
-    ])
-    return "\n".join([
-        guide,
-        "Tools available:",
-        tool_list,
-        "",
-        f"User: {user_input}",
-        *history,
-        ""
-    ])
-
-def build_plan_prompt(user_input: str, history: List[str]) -> str:
-    tool_list = format_tool_list()
-    guide = "\n".join([
-        "You are a ReAct agent controlling a robot arm.",
-        "Output exactly ONE line.",
-        "It MUST start with: Plan:  (or you may output Final Answer: if the task is complete).",
-        "",
-        "Rules:",
-        "- Output exactly ONE line only.",
-        "- Do NOT output Action:, Observation:, or Reasoning: here.",
-        "- If uncertain, make a cautious Plan that leads to an Action next.",
-        "",
-    ])
-    return "\n".join([
-        guide,
-        "Tools available:",
-        tool_list,
-        "",
-        f"User: {user_input}",
-        *history,
-        ""
-    ])
-
-def build_action_prompt(user_input: str, history: List[str]) -> str:
-    tool_list = format_tool_list()
-    guide = "\n".join([
-        "You are a ReAct agent controlling a robot arm.",
-        "Output exactly ONE line.",
-        "It MUST start with: Action:",
-        "",
-        "Rules:",
-        "- Output exactly ONE line only.",
-        "- Do NOT output Plan:, Observation:, Reasoning:, or Final Answer: here.",
-        "- Use ONLY the tool names/signatures exactly as listed.",
-        "- Do not invent extra keyword arguments.",
-        "",
-    ])
-    return "\n".join([
-        guide,
-        "Tools available:",
-        tool_list,
-        "",
-        f"User: {user_input}",
-        *history,
-        ""
-    ])
-
-# -----------------------------------------------------------------------------
-# Remote LLM calls
-# -----------------------------------------------------------------------------
-FIRST_LINE_RE = re.compile(r"([^\r\n]*)")
-
-async def call_llm_remote_first_line(prompt: str, max_tokens: int = 200, timeout_s: int = 180) -> str:
-    try:
-        resp = await asyncio.wait_for(
-            oai_client.responses.create(
-                model=OPENAI_MODEL,
-                reasoning={"effort": "none"},
-                input=prompt,
-                max_output_tokens=max_tokens
-            ),
-            timeout=timeout_s
-        )
-
-        text = getattr(resp, "output_text", None)
-        if not text:
-            parts = []
-            for item in resp.output or []:
-                if getattr(item, "type", None) == "message":
-                    for c in (item.content or []):
-                        if getattr(c, "type", None) == "output_text":
-                            parts.append(getattr(c, "text", ""))
-            text = "".join(parts).strip()
-
-        if not text:
-            return ""
-
-        if DEBUG_FULL_OUTPUT:
-            print("=== FULL MODEL OUTPUT START ===")
-            print(text)
-            print("=== FULL MODEL OUTPUT END ===")
-
-        m = FIRST_LINE_RE.match(text.strip())
-        return m.group(1).strip() if m else text.splitlines()[0].strip()
-
-    except (asyncio.TimeoutError, OpenAIError) as e:
-        return f"Plan: (API error: {type(e).__name__}) proceed cautiously."
-
-async def call_llm_remote_full(prompt: str, max_tokens: int = 800, timeout_s: int = 180) -> str:
-    try:
-        resp = await asyncio.wait_for(
-            oai_client.responses.create(
-                model=OPENAI_MODEL,
-                reasoning={"effort": "none"},
-                input=prompt,
-                max_output_tokens=max_tokens
-            ),
-            timeout=timeout_s
-        )
-
-        text = getattr(resp, "output_text", None)
-        if not text:
-            parts = []
-            for item in resp.output or []:
-                if getattr(item, "type", None) == "message":
-                    for c in (item.content or []):
-                        if getattr(c, "type", None) == "output_text":
-                            parts.append(getattr(c, "text", ""))
-            text = "".join(parts).strip()
-
-        if not text:
-            return ""
-
-        if DEBUG_FULL_OUTPUT:
-            print("=== FULL MODEL OUTPUT START ===")
-            print(text)
-            print("=== FULL MODEL OUTPUT END ===")
-
-        return text.strip()
-
-    except (asyncio.TimeoutError, OpenAIError) as e:
-        return f"Reasoning: (API error: {type(e).__name__})"
-
-# -----------------------------------------------------------------------------
-# Reasoning sanitizer (prevents header leakage into history)
-# -----------------------------------------------------------------------------
-def sanitize_reasoning(txt: str) -> str:
-    txt = (txt or "").strip()
-    if not txt.startswith("Reasoning:"):
-        txt = "Reasoning:\n" + txt
-
-    lines = txt.splitlines()
-    out = [lines[0]]  # keep "Reasoning:" line
-
-    for line in lines[1:]:
-        s = line.strip()
-        if any(s.startswith(h) for h in FORBIDDEN_HEADERS):
-            # drop leaked stage headers entirely
-            continue
-        out.append(line)
-
-    return "\n".join(out).strip()
-
-# -----------------------------------------------------------------------------
-# Action parser — supports positional + keyword args, strings/numbers/bools/None
-# -----------------------------------------------------------------------------
-ACTION_RE = re.compile(r"^Action:\s*([\w_]+)\s*\((.*)\)\s*$")
-
-def _const_or_name(node: ast.AST) -> Any:
-    if isinstance(node, ast.Constant):
-        return node.value
-    if isinstance(node, ast.Name):
-        return node.id
-    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)) and isinstance(node.operand, ast.Constant):
-        return -node.operand.value if isinstance(node.op, ast.USub) else +node.operand.value
-    raise ValueError("Unsupported argument expression")
-
-def parse_action(response: str) -> Tuple[Optional[str], List[Any], Dict[str, Any]]:
-    m = ACTION_RE.match(response.strip())
-    if not m:
-        return None, [], {}
-    name, args_str = m.group(1), (m.group(2) or "").strip()
-    if args_str == "":
-        return name, [], {}
+    # Create the master agent
+    master_agent = MasterAgentNode()
+    
+    # Use MultiThreadedExecutor so the skills can process TF/Vision while the Agent waits for LLM
+    executor = rclpy.executors.MultiThreadedExecutor()
+    executor.add_node(master_agent)
+    executor.add_node(master_agent.unscrew_skill)
+    executor.add_node(master_agent.hold_skill)
+    
+    
 
     try:
-        node = ast.parse(f"f({args_str})", mode="eval")
-        call = node.body
-        if not isinstance(call, ast.Call):
-            return name, [], {}
-        args: List[Any] = []
-        kwargs: Dict[str, Any] = {}
-        for a in call.args:
-            try:
-                args.append(_const_or_name(a))
-            except ValueError:
-                pass
-        for kw in call.keywords:
-            key = kw.arg
-            if key is None:
-                continue
-            try:
-                kwargs[key] = _const_or_name(kw.value)
-            except ValueError:
-                pass
-        return name, args, kwargs
-    except SyntaxError:
-        return name, [], {}
-
-# -----------------------------------------------------------------------------
-# Agent state
-# -----------------------------------------------------------------------------
-class AgentState(dict):
-    input: str
-    history: List[str]
-    phase: str  # "plan" or "action"
-
-# -----------------------------------------------------------------------------
-# LangGraph nodes: think -> plan -> action -> act
-# -----------------------------------------------------------------------------
-async def think(state: AgentState) -> AgentState:
-    txt = await call_llm_remote_full(build_think_prompt(state["input"], state["history"]), max_tokens=800)
-    txt = sanitize_reasoning(txt)
-
-    state["history"].append(txt)
-    print_stage(txt)
-    return state
-
-async def plan_node(state: AgentState) -> AgentState:
-    line = await call_llm_remote_first_line(build_plan_prompt(state["input"], state["history"]), max_tokens=120)
-
-    # Allow Final Answer here, otherwise require Plan:
-    if line.startswith("Final Answer:"):
-        state["history"].append(line)
-        print_stage(line)
-        return state
-
-    if not line.startswith("Plan:"):
-        line = "Plan: Prepare next simple step"
-
-    state["history"].append(line)
-    print_stage(line)
-    state["phase"] = "action"
-    return state
-
-async def action_node(state: AgentState) -> AgentState:
-    # If already ended, skip
-    if state["history"] and state["history"][-1].startswith("Final Answer:"):
-        return state
-
-    line = await call_llm_remote_first_line(build_action_prompt(state["input"], state["history"]), max_tokens=120)
-
-    if not line.startswith("Action:"):
-        # Safe fallback: go back to planning next loop if it fails to comply
-        line = "Action: dummy()"
-
-    state["history"].append(line)
-    print_stage(line)
-    return state
-
-async def act(state: AgentState) -> AgentState:
-    if not state["history"]:
-        return state
-
-    last = state["history"][-1]
-
-    if last.startswith("Final Answer:"):
-        return state
-
-    if last.startswith("Action:"):
-        name, args, kwargs = parse_action(last)
-        tool = tools.get(name or "")
-
-        if not tool:
-            obs = f"Observation: Unknown tool '{name}'. Available: {', '.join(tools.keys())}"
-        else:
-            fn = tool.fn
-            try:
-                if inspect.iscoroutinefunction(fn):
-                    result = await fn(*args, **kwargs)
-                else:
-                    result = fn(*args, **kwargs)
-                obs = f"Observation: {result}"
-            except Exception as e:
-                obs = f"Observation: Tool '{name}' errored: {type(e).__name__}: {e}"
-
-        state["history"].append(obs)
-        print_stage(obs)
-
-    return state
-
-# -----------------------------------------------------------------------------
-# Runner
-# -----------------------------------------------------------------------------
-async def run_agent(user_query: str = "") -> List[str]:
-    graph = StateGraph(AgentState)
-
-    graph.add_node("think", think)
-    graph.add_node("plan", plan_node)
-    graph.add_node("action", action_node)
-    graph.add_node("act", act)
-
-    graph.set_entry_point("think")
-    graph.add_edge("think", "plan")
-    graph.add_edge("plan", "action")
-    graph.add_edge("action", "act")
-
-    def _branch(s: AgentState) -> str:
-        return "end" if any(line.startswith("Final Answer:") for line in s["history"]) else "continue"
-
-    graph.add_conditional_edges("act", _branch, {"continue": "think", "end": END})
-
-    app = graph.compile()
-
-    state: AgentState = {"input": user_query, "history": [], "phase": "plan"}
-    print("PROMPT:", state["input"], flush=True)
-
-    async for _ in app.astream(state, config={"recursion_limit": 400}):
+        executor.spin()
+    except KeyboardInterrupt:
         pass
+    finally:
+        master_agent.destroy_node()
+        rclpy.shutdown()
 
-    return state["history"]
-
-# -----------------------------------------------------------------------------
-# Script entrypoint
-# -----------------------------------------------------------------------------
-if __name__ == "__main__":
-    asyncio.run(run_agent(user_query="Can you call the dummy tool twice, one at a time?"))
+if __name__ == '__main__':
+    main()

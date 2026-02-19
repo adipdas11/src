@@ -4,7 +4,10 @@ import os
 import math 
 from collections import deque, OrderedDict
 
-# --- 1. INJECT VENV PATH ---
+# =====================================================================
+# 1. ENVIRONMENT SETUP
+# =====================================================================
+# Inject virtual environment path for AI models
 VENV_PATH = '/home/adip/workspaces/disassembly_ws/src/vision_training/train_vision_model/.venv/lib/python3.10/site-packages'
 sys.path.insert(0, VENV_PATH)
 
@@ -20,8 +23,10 @@ import numpy as np
 from scipy.spatial import distance as dist
 from scipy.optimize import linear_sum_assignment
 
-# --- USER SETTINGS ---
-DASHBOARD_HEIGHT = 500  
+# =====================================================================
+# 2. CONFIGURATION & PARAMETERS
+# =====================================================================
+DASHBOARD_HEIGHT = 550  
 PROCESSING_RATE_HZ = 15.0 
 
 # --- IMPORT AGENTS ---
@@ -34,7 +39,8 @@ PATH_SCOUT = "/home/adip/workspaces/disassembly_ws/src/vision_training/train_vis
 PATH_SNIPER = "/home/adip/workspaces/disassembly_ws/src/vision_training/train_vision_model/project 2 (keypoint)/runs/pose/hdd_final_run/weights/best.pt"
 PATH_REFEREE = "/home/adip/workspaces/disassembly_ws/src/vision_training/train_vision_model/project 3 (classification)/runs/classify/hdd_referee_model/weights/best.pt"
 
-# --- ZONE CONFIGURATION ---
+# --- ARUCO ZONE CONFIGURATION ---
+# Defines the polygon boundary offsets (in mm) for the workspace and disposal bins based on ArUco marker centers.
 SHAPE_CONFIG = {
     0: {"TL": (-10, -175), "TR": (-355, -175), "BR": (-380, 15), "BL": (15, 15)},
     1: {"TL": (-115, -15), "TR": (15, -15), "BR": (24, 55), "BL": (-112, 55)},
@@ -42,8 +48,11 @@ SHAPE_CONFIG = {
     3: {"TL": (-17, -12), "TR": (20, -12), "BR": (0, 160), "BL": (-45, 160)}
 }
 
-# --- GEOMETRY HELPERS ---
+# =====================================================================
+# 3. GEOMETRY & TRACKING HELPERS
+# =====================================================================
 def calculate_orientation_pca(pts):
+    """Calculates the primary orientation angle of an object using Principal Component Analysis."""
     if pts is None or len(pts) < 3: return 0.0, (0,0), (0,0)
     rect = cv2.minAreaRect(pts)
     (w, h) = rect[1]
@@ -59,6 +68,7 @@ def calculate_orientation_pca(pts):
     return float(angle_deg), cntr, end_point
 
 class AngleStabilizer:
+    """Smooths orientation angles over time to prevent jitter."""
     def __init__(self, window_size=10):
         self.window_size = window_size
         self.histories = {} 
@@ -71,6 +81,7 @@ class AngleStabilizer:
         return math.degrees(math.atan2(avg_sin, avg_cos))
 
 class CentroidTracker:
+    """Assigns and maintains consistent IDs for detected objects across frames."""
     def __init__(self, maxDisappeared=40, maxDistance=100):
         self.nextObjectID = 0
         self.objects = OrderedDict()
@@ -119,12 +130,15 @@ class CentroidTracker:
             for col in unusedCols: self.register(inputCentroids[col])
         return self.objects
 
+# =====================================================================
+# 4. MAIN VISION NODE
+# =====================================================================
 class AgentNode(Node):
     def __init__(self):
         super().__init__('vision_agent_node')
         self.get_logger().info("--- Vision System (FT300 + Pose Keys + 3D Meters + Workspace) ---")
 
-        # 1. LOAD AI MODELS
+        # --- LOAD AI MODELS ---
         try:
             self.scout = ScoutAgent(PATH_SCOUT)
             self.sniper = SniperAgent(PATH_SNIPER)
@@ -133,12 +147,12 @@ class AgentNode(Node):
             self.get_logger().error(f"❌ Model Error: {e}")
             return
 
-        # 2. TRACKING & HELPERS
+        # --- TRACKING & HELPERS ---
         self.tracker = CentroidTracker(maxDisappeared=40, maxDistance=100)
         self.angle_stabilizer = AngleStabilizer(window_size=15)
         self.bridge = CvBridge()
         
-        # 3. ARUCO
+        # --- ARUCO SETUP ---
         self.aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
         self.aruco_params = cv2.aruco.DetectorParameters()
         self.aruco_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX 
@@ -148,26 +162,40 @@ class AgentNode(Node):
         self.buffers = {} 
         self.active_polygons = {} 
 
-        # 4. SUBSCRIBERS
-        self.sub_global = self.create_subscription(CompressedImage, '/camera/camera/color/image_raw/compressed', self.cb_global, 10)
-        self.sub_depth = self.create_subscription(Image, '/camera/camera/aligned_depth_to_color/image_raw', self.cb_depth, 10)
-        self.sub_info = self.create_subscription(CameraInfo, '/camera/camera/aligned_depth_to_color/camera_info', self.cb_info, 10)
-        self.sub_local = self.create_subscription(CompressedImage, '/tool_cam/image_raw/compressed', self.cb_local, 10)
-        self.sub_wrench = self.create_subscription(WrenchStamped, '/robotiq_force_torque_sensor_broadcaster/wrench', self.cb_wrench, 10)
-        
-        # 5. PUBLISHERS
-        self.json_pub = self.create_publisher(String, '/vision/agent_state', 10)
-        self.bin_pub = self.create_publisher(String, '/vision/bin_coordinates', 10)
-        self.debug_pub_compressed = self.create_publisher(CompressedImage, '/vision/debug_feed/compressed', 10)
-        self.debug_pub_raw = self.create_publisher(Image, '/vision/debug_feed/raw', 10)
-        
+        # --- STATE VARIABLES ---
         self.frame_global = None
         self.frame_depth_meters = None 
         self.frame_local = None
         self.latest_wrench = None
         self.intrinsics = None 
+        self.robot_states = {"tool_arm": "OFFLINE", "manip_arm": "OFFLINE"} # New: Robot State Tracker
+
+        # --- SUBSCRIBERS ---
+        self.sub_global = self.create_subscription(CompressedImage, '/camera/camera/color/image_raw/compressed', self.cb_global, 10)
+        self.sub_depth = self.create_subscription(Image, '/camera/camera/aligned_depth_to_color/image_raw', self.cb_depth, 10)
+        self.sub_info = self.create_subscription(CameraInfo, '/camera/camera/aligned_depth_to_color/camera_info', self.cb_info, 10)
+        self.sub_local = self.create_subscription(CompressedImage, '/tool_cam/image_raw/compressed', self.cb_local, 10)
+        self.sub_wrench = self.create_subscription(WrenchStamped, '/robotiq_force_torque_sensor_broadcaster/wrench', self.cb_wrench, 10)
+        self.sub_states = self.create_subscription(String, '/robot_states', self.cb_robot_states, 10) # New: Robot States
         
+        # --- PUBLISHERS ---
+        self.json_pub = self.create_publisher(String, '/vision/agent_state', 10)
+        self.bin_pub = self.create_publisher(String, '/vision/bin_coordinates', 10)
+        self.debug_pub_compressed = self.create_publisher(CompressedImage, '/vision/debug_feed/compressed', 10)
+        self.debug_pub_raw = self.create_publisher(Image, '/vision/debug_feed/raw', 10)
+        
+        # --- TIMER ---
         self.timer = self.create_timer(1.0 / PROCESSING_RATE_HZ, self.processing_loop)
+
+    # -------------------------------------------------------------------------
+    # ROS Callbacks
+    # -------------------------------------------------------------------------
+    def cb_robot_states(self, msg):
+        """Receives dual-arm state updates from the State Manager."""
+        try:
+            self.robot_states = json.loads(msg.data)
+        except Exception as e:
+            self.get_logger().error(f"Robot State Parsing Error: {e}")
 
     def cb_global(self, msg):
         try: 
@@ -198,6 +226,9 @@ class AgentNode(Node):
     def cb_wrench(self, msg):
         self.latest_wrench = msg
 
+    # -------------------------------------------------------------------------
+    # Processing & Visuals
+    # -------------------------------------------------------------------------
     def get_smoothed_values(self, m_id, raw_scale, raw_cx, raw_cy):
         if m_id not in self.buffers:
             self.buffers[m_id] = { 'scale': deque(maxlen=self.smoothing_window), 'cx': deque(maxlen=self.smoothing_window), 'cy': deque(maxlen=self.smoothing_window) }
@@ -207,8 +238,8 @@ class AgentNode(Node):
         b['cy'].append(raw_cy)
         return (sum(b['scale'])/len(b['scale']), sum(b['cx'])/len(b['cx']), sum(b['cy'])/len(b['cy']))
 
-    # --- 3D DEPTH CALCULATION (METERS) ---
     def get_3d_coordinates(self, cx, cy, segments_pts=None):
+        """Converts pixel coordinates to 3D points (meters) relative to the camera frame using depth data."""
         if self.frame_depth_meters is None or self.intrinsics is None:
             return None
 
@@ -235,6 +266,7 @@ class AgentNode(Node):
         return (round(x_m, 4), round(y_m, 4), round(z_m, 4))
 
     def draw_wide_dashboard(self, width, objects, bin_locations, status, wrench_data):
+        """Generates the data visualization panel appended to the bottom of the camera feeds."""
         panel = np.zeros((DASHBOARD_HEIGHT, width, 3), dtype=np.uint8)
         def draw_text(img, text, x, y, size=0.8, color=(255, 255, 255), thickness=2):
             cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, size, color, thickness)
@@ -263,38 +295,48 @@ class AgentNode(Node):
         else:
             draw_text(panel, "No parts detected", col1_x, y, 0.85, (100, 100, 100), 2)
 
-        # --- COL 2: TOOL STATUS & FORCE ---
+        # --- COL 2: TOOL STATUS, ROBOT STATES & FORCE ---
         col2_x = width // 2 - 120 
-        draw_text(panel, "TOOL & SENSORS", col2_x, 80, 0.75, (200, 200, 200), 2)
+        draw_text(panel, "VISION AI STATE", col2_x, 80, 0.75, (200, 200, 200), 2)
         
+        # 2a. Referee Box
         state = status['state'].upper()
         box_color = (50, 50, 50)
         if state == "UNSCREWED": box_color = (0, 200, 0)
         elif state == "SCREWED": box_color = (0, 140, 255)
         elif "MISALIGN" in state: box_color = (0, 0, 255)
         
-        cv2.rectangle(panel, (col2_x, 100), (col2_x + 400, 160), box_color, -1)
-        draw_text(panel, state, col2_x + 20, 140, 0.9, (255, 255, 255), 2)
+        cv2.rectangle(panel, (col2_x, 100), (col2_x + 350, 150), box_color, -1)
+        draw_text(panel, state, col2_x + 20, 135, 0.9, (255, 255, 255), 2)
         
-        y = 210
+        # 2b. Dual-Arm Robot States
+        y = 190
+        draw_text(panel, "ROBOT ARM STATES", col2_x, y, 0.75, (200, 200, 200), 2)
+        t_state = self.robot_states.get("tool_arm", "OFFLINE")
+        m_state = self.robot_states.get("manip_arm", "OFFLINE")
+        
+        draw_text(panel, f"Tool  (xArm) : {t_state}", col2_x + 10, y + 30, 0.8, (0, 255, 255), 2)
+        draw_text(panel, f"Manip (UF850): {m_state}", col2_x + 10, y + 60, 0.8, (0, 255, 255), 2)
+        
+        # 2c. Force & Torque
+        y = 290
         if wrench_data:
             f = wrench_data.wrench.force
             t = wrench_data.wrench.torque
             
-            draw_text(panel, "FORCE (N)", col2_x, y, 0.75, (200, 200, 200), 2)
+            draw_text(panel, "SENSORS (Force & Torque)", col2_x, y, 0.75, (200, 200, 200), 2)
             y += 35
             def f_col(v): return (0, 0, 255) if abs(v) > 50.0 else (0, 255, 0)
             
-            draw_text(panel, f"Fx: {f.x:>7.2f}", col2_x + 10, y, 0.85, f_col(f.x), 2)
-            draw_text(panel, f"Fy: {f.y:>7.2f}", col2_x + 10, y + 35, 0.85, f_col(f.y), 2)
-            draw_text(panel, f"Fz: {f.z:>7.2f}", col2_x + 10, y + 70, 0.85, f_col(f.z), 2)
+            # Formatted clear texts for forces and torques
+            draw_text(panel, f"Force X:  {f.x:>7.2f} N", col2_x + 10, y, 0.85, f_col(f.x), 2)
+            draw_text(panel, f"Force Y:  {f.y:>7.2f} N", col2_x + 10, y + 35, 0.85, f_col(f.y), 2)
+            draw_text(panel, f"Force Z:  {f.z:>7.2f} N", col2_x + 10, y + 70, 0.85, f_col(f.z), 2)
 
-            y += 120
-            draw_text(panel, "TORQUE (Nm)", col2_x, y, 0.75, (200, 200, 200), 2)
-            y += 35
-            draw_text(panel, f"Tx: {t.x:>7.3f}", col2_x + 10, y, 0.85, (180, 180, 180), 2)
-            draw_text(panel, f"Ty: {t.y:>7.3f}", col2_x + 10, y + 35, 0.85, (180, 180, 180), 2)
-            draw_text(panel, f"Tz: {t.z:>7.3f}", col2_x + 10, y + 70, 0.85, (180, 180, 180), 2)
+            y += 110
+            draw_text(panel, f"Torque X: {t.x:>7.3f} Nm", col2_x + 10, y, 0.85, (180, 180, 180), 2)
+            draw_text(panel, f"Torque Y: {t.y:>7.3f} Nm", col2_x + 10, y + 35, 0.85, (180, 180, 180), 2)
+            draw_text(panel, f"Torque Z: {t.z:>7.3f} Nm", col2_x + 10, y + 70, 0.85, (180, 180, 180), 2)
         else:
             draw_text(panel, "FT SENSOR OFF", col2_x, y, 0.85, (0, 0, 255), 2)
 
@@ -303,7 +345,6 @@ class AgentNode(Node):
         draw_text(panel, "LOCATIONS (Cam Frame)", col3_x, 80, 0.75, (200, 200, 200), 2)
         y = 120
         
-        # Display Workspace First
         if "workspace" in bin_locations:
             ws = bin_locations["workspace"]
             xyz = ws.get("xyz")
@@ -326,6 +367,7 @@ class AgentNode(Node):
         return panel
 
     def processing_loop(self):
+        """Main execution loop running at PROCESSING_RATE_HZ."""
         if self.intrinsics is None:
             self.get_logger().warn("⚠️ Waiting for Camera Intrinsics...", throttle_duration_sec=2.0)
         elif self.frame_depth_meters is None:
@@ -362,17 +404,14 @@ class AgentNode(Node):
                         poly_arr = np.array(poly_pts, np.int32).reshape((-1, 1, 2))
                         self.active_polygons[marker_id] = poly_arr
 
-                        # --- NEW: CALCULATE 3D POSITION FOR ALL MARKERS ---
-                        # Use the marker center point for depth calculation
+                        # Calculate 3D position for all markers
                         xyz_meters = self.get_3d_coordinates(int(cx), int(cy), poly_arr)
-                        
-                        # Store in dictionary with readable keys
                         key_name = "workspace" if marker_id == 0 else f"bin_{marker_id}"
                         
                         bin_locations[key_name] = {
                             "id": int(marker_id),
                             "px": [int(cx), int(cy)],
-                            "xyz": xyz_meters # [X, Y, Z] relative to camera optical frame
+                            "xyz": xyz_meters 
                         }
 
             workspace_poly = self.active_polygons.get(0, None)
@@ -385,6 +424,7 @@ class AgentNode(Node):
             raw_objects.sort(key=lambda x: x.get('box', [0])[0])
             valid_objects = []
             rects = []
+            
             for obj in raw_objects:
                 box = obj.get('box') or obj.get('bbox') or obj.get('xyxy')
                 if not box: continue
@@ -400,6 +440,7 @@ class AgentNode(Node):
                     cv2.rectangle(vis_global, (int(box[0]), int(box[1])), (int(box[2]), int(box[3])), (0, 0, 255), 1)
 
             tracked_objects = self.tracker.update(rects)
+            
             for obj in valid_objects:
                 box = obj.get('box') or obj.get('bbox') or obj.get('xyxy')
                 cx = int((box[0] + box[2]) / 2)
@@ -504,7 +545,7 @@ class AgentNode(Node):
         if bin_locations: 
             self.bin_pub.publish(String(data=json.dumps(bin_locations)))
 
-        # --- 4. VISUALIZATION ---
+        # --- 4. VISUALIZATION EXPORT ---
         try:
             h_target = 480 
             def resize_h(img, target_h):

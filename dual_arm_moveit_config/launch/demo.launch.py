@@ -99,6 +99,12 @@ def launch_setup(context, *args, **kwargs):
         arguments=["-d", rviz_config_file],
         parameters=[moveit_config.to_dict()],
     )
+    
+    state_manager = ExecuteProcess(
+            cmd=['ros2', 'run', 'dual_arm_moveit_config', 'state_manager.py'],
+            output='screen',
+            on_exit=Shutdown()
+        )
 
     # 6. Execution Sequence
     return [
@@ -121,12 +127,18 @@ def launch_setup(context, *args, **kwargs):
             LogInfo(msg="🧠 Step 4: Starting MoveGroup Brain..."),
             run_move_group_node
         ]),
+        
+        TimerAction(period=14.0, actions=[
+            LogInfo(msg="✅ Step 4: Starting State Manager..."),
+            state_manager
+        ]),
 
         TimerAction(period=16.0, actions=[
             LogInfo(msg="📊 Step 5: Opening RViz Visualization..."),
             run_rviz_node,
             LogInfo(msg="✅ SYSTEM READY. Happy Disassembling!")
         ]),
+        
     ]
 
 def generate_launch_description():

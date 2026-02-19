@@ -19,6 +19,7 @@ install(
   PROGRAMS
   hardware/fake_hardware.py
   hardware/real_hardware.py
+  hardware/state_manager.py
 
   scripts/commander.py
   scripts/calibrate_eye_to_hand.py
