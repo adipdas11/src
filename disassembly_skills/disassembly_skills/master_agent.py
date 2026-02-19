@@ -22,7 +22,7 @@ from openai import AsyncOpenAI, OpenAIError
 DEBUG_FULL_OUTPUT = False
 
 # Load API key from local file
-API_KEY_FILE = "src/api_key.txt"
+API_KEY_FILE = "api_key.txt"
 try:
     with open(API_KEY_FILE, "r") as f:
         OPENAI_API_KEY = f.read().strip()
