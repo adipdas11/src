@@ -19,7 +19,9 @@ import std_srvs.srv
 from xarm.wrapper import XArmAPI
 
 # ==========================================
-ROBOT_IP = '192.168.1.239' 
+# DYNAMIC SDK IPs
+XARM_IP = '192.168.1.239' 
+UF850_IP = '192.168.1.195'
 # ==========================================
 
 class MotionBackend:
@@ -36,24 +38,35 @@ class MotionBackend:
         self._reset_srv = self.node.create_client(std_srvs.srv.Empty, '/xarm/reset_robot')
         
         # --- Direct Hardware Connection (SDK) ---
-        try:
-            self.node.get_logger().info(f"🔗 Connecting to native xArm SDK at {ROBOT_IP}...")
-            self.arm = XArmAPI(ROBOT_IP)
-            self.arm.motion_enable(enable=True)
-            self.arm.set_mode(0)
-            self.arm.set_state(state=0)
+        # Dynamically assign the correct IP based on the MoveIt group
+        target_ip = None
+        if "uf" in self.group_name.lower():
+            target_ip = UF850_IP
+        elif "xarm" in self.group_name.lower():
+            target_ip = XARM_IP
             
-            # 👈 [CRITICAL FIX] Force Controller to ignore internal TCP offset
-            # We calculate tool length manually in Python, so Controller must be 0
-            self.arm.set_tcp_offset([0, 0, 0, 0, 0, 0])
-            self.node.get_logger().info("✅ Native SDK Connected & TCP Offset Cleared to [0,0,0]!")
-            
-        except Exception as e:
-            self.node.get_logger().error(f"❌ Failed to connect to xArm SDK: {e}")
+        if target_ip:
+            try:
+                self.node.get_logger().info(f"🔗 Connecting Native SDK to {target_ip} for group '{self.group_name}'...")
+                self.arm = XArmAPI(target_ip)
+                self.arm.motion_enable(enable=True)
+                self.arm.set_mode(0)
+                self.arm.set_state(state=0)
+                
+                # [CRITICAL FIX] Force Controller to ignore internal TCP offset
+                self.arm.set_tcp_offset([0, 0, 0, 0, 0, 0])
+                self.node.get_logger().info(f"✅ Native SDK Connected ({target_ip}) & TCP Offset Cleared!")
+                
+            except Exception as e:
+                self.node.get_logger().error(f"❌ Failed to connect to SDK at {target_ip}: {e}")
+        else:
+            self.node.get_logger().info(f"⏭️ No SDK connection needed for group '{self.group_name}'.")
 
         self._current_goal_handle = None
         self.current_joint_msg = None
         self.current_joint_positions = {}
+        # NEW: Effort storage for contact sensing
+        self.current_joint_efforts = {}
         self.state_received = threading.Event()
         
         # Subscribers & TF
@@ -62,9 +75,13 @@ class MotionBackend:
         self.tf_listener = TransformListener(self.tf_buffer, self.node)
 
     def _joint_state_callback(self, msg):
+        """Updated to extract both position and effort data."""
         self.current_joint_msg = msg
-        for name, pos in zip(msg.name, msg.position):
-            self.current_joint_positions[name] = pos
+        for i, name in enumerate(msg.name):
+            self.current_joint_positions[name] = msg.position[i]
+            # Capture effort spikes for tactile feedback
+            if len(msg.effort) > i:
+                self.current_joint_efforts[name] = msg.effort[i]
         self.state_received.set()
 
     def _get_full_robot_state(self):
@@ -89,7 +106,6 @@ class MotionBackend:
             self.arm.motion_enable(enable=True)
             self.arm.set_mode(0)
             self.arm.set_state(state=0)
-            # Ensure TCP is cleared on reset too
             self.arm.set_tcp_offset([0, 0, 0, 0, 0, 0])
             
         if self._reset_srv.wait_for_service(timeout_sec=1.0):
@@ -228,9 +244,7 @@ class MotionBackend:
         while not rf.done(): time.sleep(0.1)
         return rf.result().result.error_code.val == 1
 
-    # =========================================================================
-    # ⚡ DIRECT PYTHON SDK CONTROLLERS (Position Mode 0)
-    # =========================================================================
+    # --- DIRECT PYTHON SDK CONTROLLERS (Position Mode 0) ---
 
     def move_to_absolute_pose_sdk(self, x_m, y_m, z_m, speed_mm_s=50.0):
         if not hasattr(self, 'arm'): return False

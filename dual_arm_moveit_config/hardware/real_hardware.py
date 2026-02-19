@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 import rclpy
 from rclpy.node import Node
-from rclpy.action import ActionServer, CancelResponse, GoalResponse
+from rclpy.action import ActionServer
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from control_msgs.action import FollowJointTrajectory
 from sensor_msgs.msg import JointState
-from geometry_msgs.msg import Twist  # <--- NEW: For Velocity Control
-from std_srvs.srv import Empty, Trigger, SetBool # <--- NEW: For Mode Switching
+from geometry_msgs.msg import Twist
+from std_srvs.srv import Empty, SetBool
 from xarm.wrapper import XArmAPI
 from pymodbus.client.sync import ModbusTcpClient as ModbusClient
 import time
@@ -49,12 +49,28 @@ class RG:
 class RealRobotInterface:
     def __init__(self, ip, name, dof, logger, has_linear_track=False):
         self.ip=ip; self.name=name; self.dof=dof; self.logger=logger; self.has_linear_track=has_linear_track
-        self.arm = XArmAPI(self.ip); self.connected=False; self.connect()
+        self.arm = XArmAPI(self.ip); self.connected=False
+        
+        # --- STABILITY PARAMETERS ---
+        self.prev_pos = [0.0] * self.dof
+        self.prev_time = time.time()
+        
+        # Velocity Smoothing: Moving Average Window (Last 5 samples)
+        self.vel_window_size = 5 
+        self.vel_history = [[0.0] * self.dof for _ in range(self.vel_window_size)]
+        
+        # Torque Smoothing & Deadband
+        self.prev_eff = [0.0] * self.dof
+        self.torque_deadband = 0.08  # Nm: Ignore fluctuations below this
+        self.eff_alpha = 0.15         # Filter: Lower is smoother/slower
+        
+        self.connect()
     
     def connect(self):
         try:
             self.arm.connect(); self.arm.motion_enable(enable=True); self.arm.clean_error()
-            self.arm.set_mode(1); self.arm.set_state(0); self.arm.set_report_tau_or_i(0) 
+            self.arm.set_mode(1); self.arm.set_state(0)
+            self.arm.set_report_tau_or_i(0) # 0 = Nm (Torque)
             if self.has_linear_track: self._init_linear_track()
             self.connected=True
         except Exception as e: raise e
@@ -73,18 +89,53 @@ class RealRobotInterface:
     def get_full_state(self):
         if not self.connected: return ([0.0]*self.dof, [0.0]*self.dof, [0.0]*self.dof)
         try:
-            c, a = self.arm.get_servo_angle(is_radian=True)
-            if c!=0 or not a: return ([0.0]*self.dof, [0.0]*self.dof, [0.0]*self.dof)
-            return (a[:self.dof], [0.0]*self.dof, [0.0]*self.dof)
-        except: return ([0.0]*self.dof, [0.0]*self.dof, [0.0]*self.dof)
+            now = time.time()
+            dt = now - self.prev_time
+            code_p, pos = self.arm.get_servo_angle(is_radian=True)
+            code_t, effort = self.arm.get_joints_torque()
+            
+            if code_p == 0 and code_t == 0 and pos:
+                curr_pos = pos[:self.dof]
+                raw_eff = effort[:self.dof]
+                
+                # --- 1. STABLE VELOCITY (Moving Average) ---
+                curr_vel = [0.0] * self.dof
+                if dt > 0.001:
+                    inst_vel = [(curr_pos[i] - self.prev_pos[i]) / dt for i in range(self.dof)]
+                    self.vel_history.pop(0)
+                    self.vel_history.append(inst_vel)
+                    for i in range(self.dof):
+                        curr_vel[i] = sum(h[i] for h in self.vel_history) / self.vel_window_size
+                
+                # --- 2. STABLE EFFORT (Deadband + Exponential Filter) ---
+                stable_eff = []
+                for i in range(self.dof):
+                    # Only update if the change is significant (Deadband)
+                    if abs(raw_eff[i] - self.prev_eff[i]) < self.torque_deadband:
+                        val = self.prev_eff[i]
+                    else:
+                        # Smooth the transition (LPF)
+                        val = (self.eff_alpha * raw_eff[i]) + ((1 - self.eff_alpha) * self.prev_eff[i])
+                    stable_eff.append(val)
+
+                self.prev_pos = curr_pos
+                self.prev_eff = stable_eff
+                self.prev_time = now
+                return (curr_pos, curr_vel, stable_eff)
+        except: pass
+        return ([0.0]*self.dof, [0.0]*self.dof, [0.0]*self.dof)
+
     def get_linear_track_pos(self):
         if not self.connected or not self.has_linear_track: return 0.0
         c, p = self.arm.get_linear_track_pos()
         return -1.0 * (p / 1000.0) if c==0 and p else 0.0
+
     def set_servo_angle(self, angles):
         if self.connected: self.arm.set_servo_angle_j(angles=angles, is_radian=True)
+
     def set_linear_track(self, pos_meters):
         if self.connected and self.has_linear_track: self.arm.set_linear_track_pos(abs(pos_meters)*1000.0, wait=False)
+
     def disconnect(self):
         self.connected=False; self.arm.disconnect()
 
@@ -94,7 +145,7 @@ class RealHardware(Node):
         self.cb_group = ReentrantCallbackGroup()
         self.xarm = None; self.uf850 = None; self.gripper = None
         self.stop_current_motion = False 
-        self.velocity_mode_active = False # Flag for velocity mode
+        self.velocity_mode_active = False
 
         try:
             self.xarm = RealRobotInterface(XARM_IP, "xArm5", 5, self.get_logger(), has_linear_track=True)
@@ -102,18 +153,13 @@ class RealHardware(Node):
             self.gripper = RG('rg6', GRIPPER_IP, self.get_logger())
         except Exception as e: sys.exit(1)
 
-        # --- SERVICES ---
+        # Services & Topics
         self._stop_service = self.create_service(Empty, '/xarm/stop_robot', self.handle_stop_request, callback_group=self.cb_group)
         self._reset_service = self.create_service(Empty, '/xarm/reset_robot', self.handle_reset_request, callback_group=self.cb_group)
-        
-        # NEW: Velocity Mode Switch
         self._vel_mode_srv = self.create_service(SetBool, '/xarm/set_velocity_mode', self.handle_velocity_mode_request, callback_group=self.cb_group)
-
-        # --- SUBSCRIBERS ---
-        # NEW: Velocity Command Topic
         self._vel_sub = self.create_subscription(Twist, '/xarm/velo_cmd', self.handle_velocity_command, 10)
 
-        # --- ACTIONS ---
+        # Action Servers
         self._xarm_server = ActionServer(self, FollowJointTrajectory, '/xarm_controller/follow_joint_trajectory', execute_callback=self.execute_xarm_callback, callback_group=self.cb_group)
         self._uf_server = ActionServer(self, FollowJointTrajectory, '/uf_controller/follow_joint_trajectory', execute_callback=self.execute_uf_callback, callback_group=self.cb_group)
         self._rg6_server = ActionServer(self, FollowJointTrajectory, '/rg6_controller/follow_joint_trajectory', execute_callback=self.execute_gripper_callback, callback_group=self.cb_group)
@@ -125,44 +171,28 @@ class RealHardware(Node):
 
     def handle_velocity_mode_request(self, request, response):
         if request.data: 
-            self.get_logger().info("🔄 Switching xArm to CARTESIAN VELOCITY MODE (5)...")
-            self.xarm.arm.set_state(4)  # Stop 
-            time.sleep(0.1)
-            self.xarm.arm.set_mode(5)   # Mode 5 = Cartesian Velocity
-            self.xarm.arm.set_state(0)  # Ready
+            self.xarm.arm.set_state(4); time.sleep(0.1)
+            self.xarm.arm.set_mode(5); self.xarm.arm.set_state(0)
             self.velocity_mode_active = True
-            response.success = True
         else:
-            self.get_logger().info("🛑 Disabling Velocity Mode (Back to Mode 1)...")
-            self.xarm.arm.set_mode(1)
-            self.xarm.arm.set_state(0)
+            self.xarm.arm.set_mode(1); self.xarm.arm.set_state(0)
             self.velocity_mode_active = False
-            response.success = True
+        response.success = True
         return response
 
     def handle_velocity_command(self, msg):
         if self.velocity_mode_active and self.xarm and self.xarm.connected:
-            # Linear: m/s -> mm/s
-            vx = msg.linear.x * 1000.0  
-            vy = msg.linear.y * 1000.0  
-            vz = msg.linear.z * 1000.0  
-            
-            # Angular: rad/s -> deg/s (Maps to Joint 5 on xArm5)
+            vx, vy, vz = msg.linear.x * 1000.0, msg.linear.y * 1000.0, msg.linear.z * 1000.0
             v_yaw = math.degrees(msg.angular.z) 
-
-            # vc_set_cartesian_velocity([x, y, z, roll, pitch, yaw])
             self.xarm.arm.vc_set_cartesian_velocity([vx, vy, vz, 0.0, 0.0, v_yaw])
 
-    # --- EXISTING HANDLERS ---
     def handle_stop_request(self, request, response):
-        self.get_logger().error("🚨 STOP REQUEST")
         self.stop_current_motion = True
         if self.xarm: self.xarm.stop()
         if self.uf850: self.uf850.stop()
         return response
 
     def handle_reset_request(self, request, response):
-        self.get_logger().info("♻️ RESET REQUEST")
         self.stop_current_motion = False
         if self.xarm: self.xarm.force_enable()
         if self.uf850: self.uf850.force_enable()
@@ -171,42 +201,30 @@ class RealHardware(Node):
     def execute_trajectory(self, goal_handle, robot_obj, joint_map_indices):
         if not robot_obj or not robot_obj.connected:
             goal_handle.abort(); return FollowJointTrajectory.Result()
-
         self.stop_current_motion = False
-        # Ensure we are in Position Mode (1) before trajectory execution
         if self.velocity_mode_active:
-             self.get_logger().warn("⚠️ Auto-switching back to Position Mode for Trajectory")
-             robot_obj.arm.set_mode(1); robot_obj.arm.set_state(0)
-             self.velocity_mode_active = False
-        else:
-             robot_obj.force_enable()
+             robot_obj.arm.set_mode(1); robot_obj.arm.set_state(0); self.velocity_mode_active = False
+        else: robot_obj.force_enable()
 
         traj = goal_handle.request.trajectory
         points = traj.points
-        
         for i in range(len(points) - 1):
             if self.stop_current_motion or goal_handle.is_cancel_requested:
                 goal_handle.canceled(); robot_obj.stop(); return FollowJointTrajectory.Result()
-
-            start_pt = points[i]; end_pt = points[i+1]
+            start_pt, end_pt = points[i], points[i+1]
             duration = (end_pt.time_from_start.sec + end_pt.time_from_start.nanosec*1e-9) - (start_pt.time_from_start.sec + start_pt.time_from_start.nanosec*1e-9)
             if duration <= 0: continue
             step = 0.02; t = 0.0
-            
             while t < duration:
                 if self.stop_current_motion or goal_handle.is_cancel_requested:
                     goal_handle.canceled(); robot_obj.stop(); return FollowJointTrajectory.Result()
                 fract = t / duration
-                cmd_angles = []
-                for idx in joint_map_indices:
-                    s = start_pt.positions[idx]; e = end_pt.positions[idx]
-                    cmd_angles.append(self.linear_interpolate(s, e, fract))
+                cmd_angles = [self.linear_interpolate(start_pt.positions[idx], end_pt.positions[idx], fract) for idx in joint_map_indices]
                 robot_obj.set_servo_angle(cmd_angles)
                 time.sleep(step); t += step
 
         if not self.stop_current_motion:
-            final_angles = [points[-1].positions[idx] for idx in joint_map_indices]
-            robot_obj.set_servo_angle(final_angles)
+            robot_obj.set_servo_angle([points[-1].positions[idx] for idx in joint_map_indices])
             goal_handle.succeed()
         return FollowJointTrajectory.Result()
 
@@ -225,17 +243,32 @@ class RealHardware(Node):
 
     def publish_real_states(self):
         msg = JointState(); msg.header.stamp = self.get_clock().now().to_msg()
-        x_p, _, _ = self.xarm.get_full_state() if self.xarm else ([0.0]*5, [], [])
-        u_p, _, _ = self.uf850.get_full_state() if self.uf850 else ([0.0]*6, [], [])
+        
+        # Fetch Position, Velocity, and Effort for both robots
+        x_p, x_v, x_e = self.xarm.get_full_state() if self.xarm else ([0.0]*5, [0.0]*5, [0.0]*5)
+        u_p, u_v, u_e = self.uf850.get_full_state() if self.uf850 else ([0.0]*6, [0.0]*6, [0.0]*6)
+        
         self.loop_count += 1
         if self.gripper and self.loop_count >= 10:
             try: self.cached_gripper_width = self.gripper.get_width()
             except: pass
             self.loop_count = 0
+            
         g = self.mm_to_rad(self.cached_gripper_width)
         s = self.xarm.get_linear_track_pos() if self.xarm else 0.0
-        msg.name = ['xarm5_joint1', 'xarm5_joint2', 'xarm5_joint3', 'xarm5_joint4', 'xarm5_joint5', 'u1_joint1', 'u1_joint2', 'u1_joint3', 'u1_joint4', 'u1_joint5', 'u1_joint6', 'slider_slider_joint', 'rg6_l_out', 'rg6_r_out', 'rg6_l_tip', 'rg6_r_tip', 'rg6_l_passive', 'rg6_r_passive']
+        
+        msg.name = [
+            'xarm5_joint1', 'xarm5_joint2', 'xarm5_joint3', 'xarm5_joint4', 'xarm5_joint5', 
+            'u1_joint1', 'u1_joint2', 'u1_joint3', 'u1_joint4', 'u1_joint5', 'u1_joint6', 
+            'slider_slider_joint', 'rg6_l_out', 'rg6_r_out', 'rg6_l_tip', 'rg6_r_tip', 
+            'rg6_l_passive', 'rg6_r_passive'
+        ]
+        
+        # Map all data to message arrays
         msg.position = x_p + u_p + [s] + [g, -g, g, -g, -g, -g]
+        msg.velocity = x_v + u_v + [0.0] + [0.0]*6
+        msg.effort = x_e + u_e + [0.0] + [0.0]*6
+        
         self.publisher_.publish(msg)
 
     def destroy_node(self):
