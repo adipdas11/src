@@ -32,3 +32,6 @@ build/
 install/
 log/
 *.log
+
+# API Keys
+**/api_key.txt
