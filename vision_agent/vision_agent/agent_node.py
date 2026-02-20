@@ -82,35 +82,51 @@ class AngleStabilizer:
 
 class CentroidTracker:
     """Assigns and maintains consistent IDs for detected objects across frames."""
-    def __init__(self, maxDisappeared=40, maxDistance=100):
+    # CHANGED: maxDisappeared is now 300 to handle ~20 seconds of occlusion
+    def __init__(self, maxDisappeared=300, maxDistance=100):
         self.nextObjectID = 0
         self.objects = OrderedDict()
+        self.objectLabels = OrderedDict() # CHANGED: Added dictionary to store class labels
         self.disappeared = OrderedDict()
         self.maxDisappeared = maxDisappeared
         self.maxDistance = maxDistance
-    def register(self, centroid):
+        
+    def register(self, centroid, label): # CHANGED: Now accepts label
         self.objects[self.nextObjectID] = centroid
+        self.objectLabels[self.nextObjectID] = label
         self.disappeared[self.nextObjectID] = 0
         self.nextObjectID += 1
+        
     def deregister(self, objectID):
         del self.objects[objectID]
+        del self.objectLabels[objectID] # CHANGED: Deregister label
         del self.disappeared[objectID]
-    def update(self, rects):
+        
+    def update(self, rects, labels): # CHANGED: Now expects a list of labels too
         if len(rects) == 0:
             for objectID in list(self.disappeared.keys()):
                 self.disappeared[objectID] += 1
                 if self.disappeared[objectID] > self.maxDisappeared: self.deregister(objectID)
             return self.objects
+            
         inputCentroids = np.zeros((len(rects), 2), dtype="int")
         for (i, (startX, startY, endX, endY)) in enumerate(rects):
             cX = int((startX + endX) / 2.0); cY = int((startY + endY) / 2.0)
             inputCentroids[i] = (cX, cY)
+            
         if len(self.objects) == 0:
-            for i in range(0, len(inputCentroids)): self.register(inputCentroids[i])
+            for i in range(0, len(inputCentroids)): self.register(inputCentroids[i], labels[i])
         else:
             objectIDs = list(self.objects.keys())
             objectCentroids = list(self.objects.values())
             D = dist.cdist(np.array(objectCentroids), inputCentroids)
+            
+            # CHANGED: Penalize mismatching labels so IDs don't jump between different parts
+            for row, obj_id in enumerate(objectIDs):
+                for col, label in enumerate(labels):
+                    if self.objectLabels[obj_id] != label:
+                        D[row, col] = 99999 
+            
             rows, cols = linear_sum_assignment(D)
             usedRows = set(); usedCols = set()
             for (row, col) in zip(rows, cols):
@@ -121,13 +137,16 @@ class CentroidTracker:
                 self.disappeared[objectID] = 0
                 usedRows.add(row)
                 usedCols.add(col)
+                
             unusedRows = set(range(0, D.shape[0])).difference(usedRows)
             for row in unusedRows:
                 objectID = objectIDs[row]
                 self.disappeared[objectID] += 1
                 if self.disappeared[objectID] > self.maxDisappeared: self.deregister(objectID)
+                
             unusedCols = set(range(0, D.shape[1])).difference(usedCols)
-            for col in unusedCols: self.register(inputCentroids[col])
+            for col in unusedCols: self.register(inputCentroids[col], labels[col])
+            
         return self.objects
 
 # =====================================================================
@@ -148,7 +167,8 @@ class AgentNode(Node):
             return
 
         # --- TRACKING & HELPERS ---
-        self.tracker = CentroidTracker(maxDisappeared=40, maxDistance=100)
+        # CHANGED: maxDisappeared updated to 300 to match the class default
+        self.tracker = CentroidTracker(maxDisappeared=300, maxDistance=100)
         self.angle_stabilizer = AngleStabilizer(window_size=15)
         self.bridge = CvBridge()
         
@@ -168,7 +188,7 @@ class AgentNode(Node):
         self.frame_local = None
         self.latest_wrench = None
         self.intrinsics = None 
-        self.robot_states = {"tool_arm": "OFFLINE", "manip_arm": "OFFLINE"} # New: Robot State Tracker
+        self.robot_states = {"tool_arm": "OFFLINE", "manip_arm": "OFFLINE"}
 
         # --- SUBSCRIBERS ---
         self.sub_global = self.create_subscription(CompressedImage, '/camera/camera/color/image_raw/compressed', self.cb_global, 10)
@@ -176,7 +196,7 @@ class AgentNode(Node):
         self.sub_info = self.create_subscription(CameraInfo, '/camera/camera/aligned_depth_to_color/camera_info', self.cb_info, 10)
         self.sub_local = self.create_subscription(CompressedImage, '/tool_cam/image_raw/compressed', self.cb_local, 10)
         self.sub_wrench = self.create_subscription(WrenchStamped, '/robotiq_force_torque_sensor_broadcaster/wrench', self.cb_wrench, 10)
-        self.sub_states = self.create_subscription(String, '/robot_states', self.cb_robot_states, 10) # New: Robot States
+        self.sub_states = self.create_subscription(String, '/robot_states', self.cb_robot_states, 10)
         
         # --- PUBLISHERS ---
         self.json_pub = self.create_publisher(String, '/vision/agent_state', 10)
@@ -191,7 +211,6 @@ class AgentNode(Node):
     # ROS Callbacks
     # -------------------------------------------------------------------------
     def cb_robot_states(self, msg):
-        """Receives dual-arm state updates from the State Manager."""
         try:
             self.robot_states = json.loads(msg.data)
         except Exception as e:
@@ -239,7 +258,6 @@ class AgentNode(Node):
         return (sum(b['scale'])/len(b['scale']), sum(b['cx'])/len(b['cx']), sum(b['cy'])/len(b['cy']))
 
     def get_3d_coordinates(self, cx, cy, segments_pts=None):
-        """Converts pixel coordinates to 3D points (meters) relative to the camera frame using depth data."""
         if self.frame_depth_meters is None or self.intrinsics is None:
             return None
 
@@ -266,7 +284,6 @@ class AgentNode(Node):
         return (round(x_m, 4), round(y_m, 4), round(z_m, 4))
 
     def draw_wide_dashboard(self, width, objects, bin_locations, status, wrench_data):
-        """Generates the data visualization panel appended to the bottom of the camera feeds."""
         panel = np.zeros((DASHBOARD_HEIGHT, width, 3), dtype=np.uint8)
         def draw_text(img, text, x, y, size=0.8, color=(255, 255, 255), thickness=2):
             cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, size, color, thickness)
@@ -328,7 +345,6 @@ class AgentNode(Node):
             y += 35
             def f_col(v): return (0, 0, 255) if abs(v) > 50.0 else (0, 255, 0)
             
-            # Formatted clear texts for forces and torques
             draw_text(panel, f"Force X:  {f.x:>7.2f} N", col2_x + 10, y, 0.85, f_col(f.x), 2)
             draw_text(panel, f"Force Y:  {f.y:>7.2f} N", col2_x + 10, y + 35, 0.85, f_col(f.y), 2)
             draw_text(panel, f"Force Z:  {f.z:>7.2f} N", col2_x + 10, y + 70, 0.85, f_col(f.z), 2)
@@ -367,7 +383,6 @@ class AgentNode(Node):
         return panel
 
     def processing_loop(self):
-        """Main execution loop running at PROCESSING_RATE_HZ."""
         if self.intrinsics is None:
             self.get_logger().warn("⚠️ Waiting for Camera Intrinsics...", throttle_duration_sec=2.0)
         elif self.frame_depth_meters is None:
@@ -404,7 +419,6 @@ class AgentNode(Node):
                         poly_arr = np.array(poly_pts, np.int32).reshape((-1, 1, 2))
                         self.active_polygons[marker_id] = poly_arr
 
-                        # Calculate 3D position for all markers
                         xyz_meters = self.get_3d_coordinates(int(cx), int(cy), poly_arr)
                         key_name = "workspace" if marker_id == 0 else f"bin_{marker_id}"
                         
@@ -422,24 +436,31 @@ class AgentNode(Node):
 
             raw_objects, _ = self.scout.scan(self.frame_global)
             raw_objects.sort(key=lambda x: x.get('box', [0])[0])
+            
             valid_objects = []
             rects = []
+            labels = [] # CHANGED: Create list to hold labels for tracker
             
             for obj in raw_objects:
                 box = obj.get('box') or obj.get('bbox') or obj.get('xyxy')
+                label = obj.get('label') # CHANGED: Get the object's class label
                 if not box: continue
+                
                 cx = int((box[0] + box[2]) / 2)
                 cy = int((box[1] + box[3]) / 2)
                 is_valid = False
                 if workspace_poly is not None and cv2.pointPolygonTest(workspace_poly, (cx, cy), False) >= 0:
                     is_valid = True
+                
                 if is_valid:
                     valid_objects.append(obj)
                     rects.append(box) 
+                    labels.append(label) # CHANGED: Append label to list
                 else:
                     cv2.rectangle(vis_global, (int(box[0]), int(box[1])), (int(box[2]), int(box[3])), (0, 0, 255), 1)
 
-            tracked_objects = self.tracker.update(rects)
+            # CHANGED: Pass both rects and labels to the Class-Aware Tracker
+            tracked_objects = self.tracker.update(rects, labels)
             
             for obj in valid_objects:
                 box = obj.get('box') or obj.get('bbox') or obj.get('xyxy')

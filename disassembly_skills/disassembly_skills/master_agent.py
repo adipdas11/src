@@ -2,21 +2,19 @@
 
 import os
 import asyncio
-import inspect
 import re
-import ast
 import threading
-from typing import List, Tuple, Optional, Dict, Any
+import json
+import time
+from typing import List, Dict, Any
 
 # ROS 2 Imports
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
-from ament_index_python.packages import get_package_share_directory
 
-# LangGraph & OpenAI
-from langgraph.graph import StateGraph, END
-from openai import AsyncOpenAI, OpenAIError
+# OpenAI
+from openai import AsyncOpenAI
 
 # Local Skill Imports
 from disassembly_skills.unscrew_skill import UnscrewSkill
@@ -33,6 +31,7 @@ class TColor:
     OBSERVATION = "\033[38;5;82m"    # green
     FINAL       = "\033[38;5;201m"   # magenta
     ERROR       = "\033[38;5;196m"   # red
+    VISION      = "\033[38;5;226m"   # yellow
 
 def print_stage(text: str):
     prefix_map = {
@@ -40,7 +39,8 @@ def print_stage(text: str):
         "Plan:": TColor.PLAN,
         "Action:": TColor.ACTION,
         "Observation:": TColor.OBSERVATION,
-        "Final Answer:": TColor.FINAL
+        "Final Answer:": TColor.FINAL,
+        "Vision:": TColor.VISION
     }
     color = TColor.ERROR
     for prefix, c in prefix_map.items():
@@ -56,22 +56,28 @@ class MasterAgentNode(Node):
     def __init__(self):
         super().__init__('master_agent')
         
-        # 1. Threading Setup: Create a dedicated thread for Asyncio LLM calls
+        # 1. Threading & Sync
         self.loop = asyncio.new_event_loop()
         self.loop_thread = threading.Thread(target=self._run_async_loop, daemon=True)
         self.loop_thread.start()
         
-        # 2. Resolve API Key Path
+        # Global Storage for Vision Data
+        self.vision_lock = threading.Lock()
+        self.detected_objects = [] 
+        
+        # --- NEW: Snapshot Control ---
+        self.has_printed_startup_vision = False 
+        
+        # 2. Resolve API Key
         try:
-            # Using absolute path as requested in your logs
             api_key_path = "/home/adip/workspaces/disassembly_ws/src/disassembly_skills/config/api_key.txt"
             with open(api_key_path, "r") as f:
                 api_key = f.read().strip()
         except Exception as e:
-            self.get_logger().error(f"Could not load API key from {api_key_path}: {e}")
+            self.get_logger().error(f"Could not load API key: {e}")
             raise RuntimeError("API Key Missing.")
 
-        # 3. Setup OpenAI Client
+        # 3. Setup OpenAI
         self.model_name = os.getenv("OPENAI_MODEL", "gpt-4-turbo")
         self.oai_client = AsyncOpenAI(api_key=api_key)
 
@@ -79,138 +85,135 @@ class MasterAgentNode(Node):
         self.unscrew_skill = UnscrewSkill()
         self.hold_skill = ObjectHoldSkill()
 
-        # 5. Define Agent Tools
+        # 5. Define Tools
         self.tools = {
             "unscrew": {
                 "fn": self.unscrew_wrapper,
-                "desc": "Unscrews a part. Requires hold_id, unscrew_id, and labels.",
                 "args": ["unscrew_id", "unscrew_label", "hold_id", "hold_label"]
             },
             "hold_object": {
                 "fn": self.hold_wrapper,
-                "desc": "Secures an object using the tactile hold skill.",
                 "args": ["part_id", "label"]
             }
         }
 
         # 6. ROS Interfaces
         self.goal_sub = self.create_subscription(String, '/agent_goal', self.goal_callback, 10)
-        self.get_logger().info("🤖 Master Agent Ready. Send goals to /agent_goal")
+        self.vision_sub = self.create_subscription(String, '/vision/agent_state', self.vision_callback, 10)
+        
+        self.get_logger().info("🤖 Master Agent Ready. Waiting for vision snapshot...")
 
     def _run_async_loop(self):
-        """Internal worker for the dedicated asyncio thread."""
         asyncio.set_event_loop(self.loop)
         self.loop.run_forever()
+
+    # -------------------------------------------------------------------------
+    # Vision Data Handling (Startup Print Only)
+    # -------------------------------------------------------------------------
+    def vision_callback(self, msg):
+        """Updates global list and prints the tracking table exactly once at startup."""
+        try:
+            clean_json = msg.data.strip("'")
+            data = json.loads(clean_json)
+            raw_objects = data.get("global_view", {}).get("objects", [])
+            
+            temp_list = []
+            for obj in raw_objects:
+                temp_list.append({
+                    "id": obj.get("id"),
+                    "label": obj.get("label"),
+                    "xyz": obj.get("xyz")
+                })
+
+            with self.vision_lock:
+                self.detected_objects = temp_list
+
+            # --- PRINT ONLY ONCE ON PROGRAM START ---
+            if not self.has_printed_startup_vision and len(self.detected_objects) > 0:
+                print("\n" + "="*60)
+                print_stage(f"Vision: Startup Snapshot ({len(self.detected_objects)} parts detected).")
+                print("-" * 60)
+                
+                for item in self.detected_objects:
+                    xyz = item['xyz']
+                    # Format XYZ to 2 decimal places
+                    fmt_xyz = [round(val, 2) for val in xyz] if xyz else "None"
+                    print(f"   ID {item['id']:<2} | {item['label']:<25} | XYZ: {fmt_xyz}")
+                
+                print("="*60 + "\n")
+                self.has_printed_startup_vision = True
+
+        except Exception as e:
+            self.get_logger().error(f"Vision Error: {e}", throttle_duration_sec=10.0)
 
     # --- Tool Wrappers ---
     async def hold_wrapper(self, part_id: int, label: str):
         self.get_logger().info(f"🛠️ Executing Hold Skill on {label}...")
-        # Skill nodes run synchronously within this wrapper
         success = self.hold_skill.execute_hold(part_id=int(part_id), target_label=label, interactive=False)
-        return "SUCCESS: Object secured" if success else "FAILURE: Could not hold object"
+        return "SUCCESS: Object secured" if success else "FAILURE: Could not hold"
 
     async def unscrew_wrapper(self, unscrew_id: int, unscrew_label: str, hold_id: int, hold_label: str):
         self.get_logger().info(f"🛠️ Executing Unscrew Skill on {unscrew_label}...")
         success = self.unscrew_skill.execute_unscrew_command(target_id=int(unscrew_id), target_label=unscrew_label, interactive=False)
-        return "SUCCESS: Screw removed and disposed" if success else "FAILURE: Unscrewing failed"
+        return "SUCCESS: Screw removed" if success else "FAILURE: Unscrew failed"
 
-    # --- ReAct Agent Core ---
+    # --- ReAct Agent Loop ---
     def get_prompt_header(self):
-        tool_desc = "\n".join([f"- {k}({', '.join(v['args'])}): {v['desc']}" for k, v in self.tools.items()])
-        return (
-            f"You are a robotic disassembly agent. Tools:\n{tool_desc}\n\n"
-            "Format your response exactly as follows:\n"
-            "Reasoning: <thought process>\n"
-            "Plan: <short-term goal>\n"
-            "Action: tool_name(args)\n"
-            "Observation: <result will be provided>\n"
-            "... repeat until done ...\n"
-            "Final Answer: <summary of completion>"
-        )
+        with self.vision_lock:
+            vision_context = json.dumps(self.detected_objects)
+        return (f"You are a robotic disassembly agent.\n"
+                f"CURRENT VISIBLE OBJECTS: {vision_context}\n\n"
+                "Format: Reasoning: <thought>\nPlan: <next_step>\nAction: tool_name(args)\n"
+                "Observation: <result>\nFinal Answer: <summary>")
 
-    async def call_llm(self, prompt, max_tokens=350):
+    async def call_llm(self, prompt, max_tokens=400):
         try:
-            response = await self.oai_client.chat.completions.create(
+            res = await self.oai_client.chat.completions.create(
                 model=self.model_name,
                 messages=[{"role": "system", "content": self.get_prompt_header()},
                           {"role": "user", "content": prompt}],
-                max_tokens=max_tokens,
-                temperature=0
+                max_tokens=max_tokens, temperature=0
             )
-            return response.choices[0].message.content.strip()
-        except Exception as e:
-            return f"Error: {e}"
+            return res.choices[0].message.content.strip()
+        except Exception as e: return f"Error: {e}"
 
-    # --- Agent Execution Loop ---
     async def agent_loop(self, user_query):
         self.get_logger().info(f"🧠 Reasoning about: {user_query}")
         state = {"input": user_query, "history": []}
-        
-        for step in range(10): 
-            prompt = f"User Goal: {state['input']}\nHistory:\n" + "\n".join(state["history"]) + "\nNext Step:"
+        for _ in range(10): 
+            prompt = f"Goal: {state['input']}\nHistory:\n" + "\n".join(state["history"]) + "\nNext Step:"
             llm_out = await self.call_llm(prompt)
-            
-            # Process multi-line responses from LLM
-            lines = llm_out.splitlines()
-            for line in lines:
-                line = line.strip()
-                if not line: continue
-                
+            for line in llm_out.splitlines():
                 if line.startswith(("Reasoning:", "Plan:", "Action:", "Final Answer:")):
-                    print_stage(line)
-                    state["history"].append(line)
-
+                    print_stage(line); state["history"].append(line)
             last_entry = state["history"][-1]
-            if "Final Answer:" in last_entry:
-                break
-            
+            if "Final Answer:" in last_entry: break
             if "Action:" in last_entry:
-                # Regex to extract: tool_name(arg1, arg2...)
                 match = re.search(r"Action:\s*(\w+)\((.*)\)", last_entry)
                 if match:
                     t_name, t_args_raw = match.groups()
-                    # Clean arguments: remove quotes and whitespace
                     t_args = [a.strip().strip("'").strip('"') for a in t_args_raw.split(",") if a.strip()]
-                    
                     if t_name in self.tools:
                         obs = await self.tools[t_name]["fn"](*t_args)
                         obs_str = f"Observation: {obs}"
-                        print_stage(obs_str)
-                        state["history"].append(obs_str)
-                    else:
-                        error_msg = f"Observation: Tool {t_name} not found."
-                        print_stage(error_msg)
-                        state["history"].append(error_msg)
+                        print_stage(obs_str); state["history"].append(obs_str)
 
     def goal_callback(self, msg):
-        self.get_logger().info(f"Received Topic Goal: {msg.data}")
-        # Run the agent_loop in the dedicated asyncio thread to avoid thread errors
+        self.get_logger().info(f"Received Goal: {msg.data}")
         asyncio.run_coroutine_threadsafe(self.agent_loop(msg.data), self.loop)
 
-# -----------------------------------------------------------------------------
-# Main Execution
-# -----------------------------------------------------------------------------
 def main(args=None):
     rclpy.init(args=args)
-    
-    # Create the master agent
     master_agent = MasterAgentNode()
-    
-    # Use MultiThreadedExecutor so the skills can process TF/Vision while the Agent waits for LLM
     executor = rclpy.executors.MultiThreadedExecutor()
     executor.add_node(master_agent)
     executor.add_node(master_agent.unscrew_skill)
     executor.add_node(master_agent.hold_skill)
-    
-    
-
     try:
         executor.spin()
-    except KeyboardInterrupt:
-        pass
+    except KeyboardInterrupt: pass
     finally:
-        master_agent.destroy_node()
-        rclpy.shutdown()
+        master_agent.destroy_node(); rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
