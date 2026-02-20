@@ -20,6 +20,7 @@ install(
   hardware/fake_hardware.py
   hardware/real_hardware.py
   hardware/state_manager.py
+  hardware/object_hold_state.py
 
   scripts/commander.py
   scripts/calibrate_eye_to_hand.py

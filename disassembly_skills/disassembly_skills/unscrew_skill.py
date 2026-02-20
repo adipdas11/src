@@ -74,13 +74,15 @@ class UnscrewSkill(Node):
         self.Z_STEP_SPEED = 5.0        
         self.WIGGLE_DIST = 0.002       
         self.BLIND_DROP_LIMIT = 1      
-        self.EXTRACTION_WIGGLE_AMP = 0.0015 # Added back to fix crash
-        self.EXTRACTION_WIGGLE_SPEED = 15.0 # Added back to fix crash
+        self.EXTRACTION_WIGGLE_AMP = 0.0015 
+        self.EXTRACTION_WIGGLE_SPEED = 15.0 
+        self.RETRY_RETRACT = 0.020     
+        self.HOLE_CONFIRM_LIMIT = 5    # Consecutive frames required to confirm a missing screw
         
         # --- Force & Tactile Thresholds ---
         self.UNSCREW_RELIEF_STEP = 0.001 
         self.UNSCREW_RELIEF_THRESHOLD = 0.2 
-        self.UNSCREW_DONE_TIMEOUT = 3.0    # Stability duration required to finish
+        self.UNSCREW_DONE_TIMEOUT = 3.0    
         self.SURFACE_CONTACT_THRESH = 2.0  
         self.WIGGLE_LOCK_THRESH = 3.5      
         
@@ -236,7 +238,16 @@ class UnscrewSkill(Node):
         for _ in range(3):
             self.publish_state("MOVING")
             print("   🎯 [STEP 2] Robot aligns until tool head is inside screw head...")
-            if not self.staircase_align_and_descend(interactive=interactive): self.publish_state("UNSCREW_FAIL"); return False 
+            align_result = self.staircase_align_and_descend(interactive=interactive)
+            
+            # --- NEW LOGIC: Go straight to bin if no screw but hole detected ---
+            if align_result == "HOLE_ONLY":
+                print("   🕳️ [INFO] Hole verified, no screw present. Proceeding straight to bin...")
+                self.publish_state("MOVING")
+                self.dispose_screw("bin_1")
+                self.publish_state("UNSCREWING_COMPLETE"); time.sleep(1.0); return True
+                
+            if not align_result: self.publish_state("UNSCREW_FAIL"); return False 
                 
             if self.verify_seating():
                 self.publish_state("UNSCREWING")
@@ -269,15 +280,22 @@ class UnscrewSkill(Node):
     def staircase_align_and_descend(self, interactive=True):
         """Hybrid visual servoing and descent to lock the tool bit into the screw."""
         step_count, blind_steps_consecutive = 0, 0 
+        consecutive_hole_only = 0  # <--- NEW: Tracks how long we've ONLY seen a hole
+        
         while rclpy.ok():
             step_count += 1
             with self.data_lock:
                 local_screws = self.latest_local_data.get("screw_heads", []) if self.latest_local_data else []
                 local_holes = self.latest_local_data.get("holes", []) or self.latest_local_data.get("empty_holes", []) if self.latest_local_data else []
 
+            # --- FLICKER-RESISTANT HOLE LOGIC ---
             if local_holes and not local_screws:
-                print("      🕳️ [VISION] Only Hole Detected. Initiating auto-search...")
-                if not self.run_visual_spiral(): return False
+                consecutive_hole_only += 1
+                if consecutive_hole_only >= self.HOLE_CONFIRM_LIMIT:
+                    print(f"      🕳️ [VISION] Only Hole Detected ({self.HOLE_CONFIRM_LIMIT} times in a row). Skipping to bin...")
+                    return "HOLE_ONLY"
+            else:
+                consecutive_hole_only = 0  # Reset instantly if a screw is spotted or vision is entirely lost
             
             aligned = False; is_first = True 
             while not aligned and rclpy.ok():
@@ -393,7 +411,7 @@ class UnscrewSkill(Node):
     def run_visual_spiral(self):
         """Expanded search leg to find screw hole if visually lost."""
         self.publish_state("SPIRAL_SEARCHING")
-        dirs = [[0, -1], [-1, 0], [0, 1], [1, 0]]; leg, gap_mult = 0, 1
+        dirs = [[0, -1], [-1, 0], [0, 1], [1, 0]]; leg, gap_mult = 1, 1
         while leg < self.SPIRAL_STEPS and rclpy.ok():
             if leg > 0 and leg % 2 == 0: gap_mult += 1
             dx, dy = dirs[leg%4][0] * self.SPIRAL_GAP * gap_mult, dirs[leg%4][1] * self.SPIRAL_GAP * gap_mult

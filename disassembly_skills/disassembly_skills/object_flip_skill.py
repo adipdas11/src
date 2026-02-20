@@ -29,7 +29,9 @@ class ObjectFlipSkill(Node):
         self.is_holding_object = False
         self.last_logged_status = None  
         self.hold_event = threading.Event()
-        self.create_subscription(Bool, '/object_hold_status', self.hold_status_callback, 10)
+        
+        # Updated to listen to the new Central State Manager
+        self.create_subscription(Bool, '/object_hold_state/is_held', self.hold_status_callback, 10)
         
         # --- Publishers ---
         self.state_update_pub = self.create_publisher(String, '/robot_state/manip_arm/update', 10)
@@ -55,7 +57,7 @@ class ObjectFlipSkill(Node):
         
         # --- Tactile Feedback Configuration ---
         self.CONTACT_JOINT = "u1_joint5"       # Joint monitored for torque spikes to detect table contact
-        self.TORQUE_THRESHOLD = 1.0            # Torque threshold (Nm) that registers as physical contact
+        self.TORQUE_THRESHOLD = 3.0            # Torque threshold (Nm) that registers as physical contact
         self.RETRACT_DISTANCE = 0.005          # Distance (meters) to lift up after hitting the table (5mm)
         # =====================================================================
 
@@ -73,7 +75,7 @@ class ObjectFlipSkill(Node):
 
     def hold_status_callback(self, msg):
         """
-        Listens to the /object_hold_status topic. Triggers the threading event 
+        Listens to the /object_hold_state/is_held topic. Triggers the threading event 
         so the standalone block knows when it is safe to execute the flip.
         """
         self.is_holding_object = msg.data
@@ -206,6 +208,11 @@ class ObjectFlipSkill(Node):
         print("🤖 INITIATING FLIP SKILL")
         print("!"*60)
 
+        # --- NEW: Hard Check against library-mode execution when empty ---
+        if not self.is_holding_object:
+            self.get_logger().error("❌ Aborting: The State Manager reports the gripper is EMPTY.")
+            return False
+
         pos, quat = self.get_current_tcp_pose()
         if not pos or not quat:
             self.get_logger().error("❌ Failed to get current TCP pose.")
@@ -295,22 +302,22 @@ def main(args=None):
     
     try:
         print("\n" + "="*60)
-        print("🕒 Waiting for Hold Skill to finish (/object_hold_status update)...")
+        print("🕒 Waiting for State Manager to report HOLDING (/object_hold_state/is_held)...")
         print("="*60)
         
-        # Block until the hold_event is triggered by the subscriber
-        flip_node.hold_event.clear()
-        flip_node.hold_event.wait() 
+        # Because the State Manager broadcasts at 2Hz, we must continuously ignore
+        # the "False" messages and wait until the gripper actually secures something.
+        while rclpy.ok() and not flip_node.is_holding_object:
+            flip_node.hold_event.clear()
+            flip_node.hold_event.wait() 
         
-        if flip_node.is_holding_object:
-            # Execute exactly once
+        # Execute exactly once upon breaking the wait loop
+        if rclpy.ok() and flip_node.is_holding_object:
             success = flip_node.execute_flip(interactive=True)
             if success:
                 print("✅ Object successfully flipped and secured. Exiting Node.")
             else:
                 print("❌ Flip sequence failed. Exiting Node.")
-        else:
-            flip_node.get_logger().error("❌ Cannot execute flip. The object was not securely held.")
             
     except KeyboardInterrupt: 
         pass

@@ -33,6 +33,7 @@ setup(
             'unscrew_skill = disassembly_skills.unscrew_skill:main',
             'object_flip_skill = disassembly_skills.object_flip_skill:main',
             'master_agent = disassembly_skills.master_agent:main',
+            'object_flip_drop_skill = disassembly_skills.object_flip_drop_skill:main',
         ],
     },
 )

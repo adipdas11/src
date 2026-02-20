@@ -66,7 +66,7 @@ class ObjectHoldSkill(Node):
         
         # --- Tactile Feedback (Force/Torque) Settings ---
         self.CONTACT_JOINT = "u1_joint5"       # Specific robot joint to monitor for contact spikes
-        self.TORQUE_THRESHOLD = 1.0            # Torque spike threshold indicating physical contact (Nm)
+        self.TORQUE_THRESHOLD = 3.0            # Torque spike threshold indicating physical contact (Nm)
         self.RETRACT_DISTANCE = 0.02           # Distance to retract up after hitting the table (meters)
         
         # --- Post-Grasp Alignment ---
@@ -178,7 +178,7 @@ class ObjectHoldSkill(Node):
             actual_spike = abs(current_effort - baseline_effort)
 
             if time.time() - last_print_time > 0.1:
-                print(f"   [Live Debug] Spike: {actual_spike:.4f} Nm (Current: {current_effort:.4f})")
+                # print(f"   [Live Debug] Spike: {actual_spike:.4f} Nm (Current: {current_effort:.4f})")
                 last_print_time = time.time()
 
             # Compare the SPIKE to the threshold, not the raw value
@@ -347,6 +347,9 @@ class ObjectHoldSkill(Node):
         self.gripper.move_to_joint_positions({self.JOINT_GRIPPER: math.radians(self.CLOSE_DEG)}, "rg6", velocity=self.GRIPPER_SPEED)
         is_held = self.wait_for_gripper(self.CLOSE_DEG)
         
+        # Instantly update the state manager topic upon clamp completion!
+        self.publish_hold_status(is_held)
+        
         if not is_held:
             self.get_logger().error("❌ Failed to grasp the object.")
             self.publish_state("ERROR") # STATE UPDATE
@@ -355,17 +358,17 @@ class ObjectHoldSkill(Node):
         print(f"\n🎉 SECURED: {target_label} (2mm above sensed surface).")
         self.publish_state("HOLDING") # STATE UPDATE
 
-        # Step 6: Post-grasp squared alignment
-        if interactive: input(f"\n🚀 STEP 6: Square Object to World Axes (Yaw: {self.FINAL_ALIGN_YAW_DEG}°)? [Enter]")
-        current_pose = self.get_current_tcp_position()
-        if current_pose:
-            self.publish_state("MOVING") # STATE UPDATE for the alignment move
-            self.get_logger().info("🔄 Rotating to align object perfectly straight...")
-            self.uf850.move_to_pose_robust(
-                current_pose[0], current_pose[1], current_pose[2], q_dict_aligned, 
-                link_name=self.ROBOT_EE_LINK, velocity=0.03, frame_id=self.PLANNING_FRAME
-            )
-            self.publish_state("HOLDING") # STATE UPDATE back to holding after align
+        # # Step 6: Post-grasp squared alignment
+        # if interactive: input(f"\n🚀 STEP 6: Square Object to World Axes (Yaw: {self.FINAL_ALIGN_YAW_DEG}°)? [Enter]")
+        # current_pose = self.get_current_tcp_position()
+        # if current_pose:
+        #     self.publish_state("MOVING") # STATE UPDATE for the alignment move
+        #     self.get_logger().info("🔄 Rotating to align object perfectly straight...")
+        #     self.uf850.move_to_pose_robust(
+        #         current_pose[0], current_pose[1], current_pose[2], q_dict_aligned, 
+        #         link_name=self.ROBOT_EE_LINK, velocity=0.03, frame_id=self.PLANNING_FRAME
+        #     )
+        #     self.publish_state("HOLDING") # STATE UPDATE back to holding after align
 
         return True
 

@@ -105,6 +105,12 @@ def launch_setup(context, *args, **kwargs):
             output='screen',
             on_exit=Shutdown()
         )
+    
+    hold_state = ExecuteProcess(
+            cmd=['ros2', 'run', 'dual_arm_moveit_config', 'object_hold_state.py'],
+                output='screen',
+                on_exit=Shutdown()
+        )
 
     # 6. Execution Sequence
     return [
@@ -131,6 +137,11 @@ def launch_setup(context, *args, **kwargs):
         TimerAction(period=14.0, actions=[
             LogInfo(msg="✅ Step 4: Starting State Manager..."),
             state_manager
+        ]),
+        
+        TimerAction(period=14.5, actions=[
+            LogInfo(msg="✅ Step 4: Starting Object Hold State Manager..."),
+            hold_state
         ]),
 
         TimerAction(period=16.0, actions=[

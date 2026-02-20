@@ -31,7 +31,7 @@ class RG:
         if self.gripper == 'rg2': self.max_width=1100; self.max_force=400
         elif self.gripper == 'rg6': self.max_width=1600; self.max_force=1200
         if not self.client.connect(): pass 
-    def move_gripper(self, width_mm, force_val=1000):
+    def move_gripper(self, width_mm, force_val=1200):
         val = int(width_mm * 10); val = max(0, min(val, self.max_width))
         with self.lock: 
             try: self.client.write_registers(address=0, values=[force_val, val, 16], unit=65)
