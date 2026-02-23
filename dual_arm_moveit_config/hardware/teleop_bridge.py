@@ -6,26 +6,21 @@ from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from geometry_msgs.msg import TwistStamped
 from std_msgs.msg import Int8
 from std_srvs.srv import Trigger
-from builtin_interfaces.msg import Duration
+from controller_manager_msgs.srv import SwitchController
 
 class TeleopBridge(Node):
     def __init__(self):
-        super().__init__('teleop_bridge_direct')
+        super().__init__('teleop_bridge_final')
 
         self.active_arm = 'xarm' 
-        self.planning_frame = 'sd1_base_link' 
+        self.planning_frame = 'world_world' 
         
-        # ⚙️ Scales & Deadbands
-        self.linear_scale = 0.5   
+        # ⚙️ Scales & Filters
+        self.linear_scale = 0.8   
         self.angular_scale = 0.8  
-        self.min_velocity_boost = 0.15 
-        self.joystick_deadband = 0.05
+        self.joystick_alpha = 0.12 
 
-        # 🧈 THE MAGIC SMOOTHER: Exponential Moving Average (EMA)
-        # Lower = Smoother & heavier feel (0.1 to 0.3 is best)
-        # Higher = Sharper & more responsive
-        self.joystick_alpha = 0.15  
-
+        # 📐 6-Axis State
         self.target_linear = [0.0, 0.0, 0.0]
         self.target_angular = [0.0, 0.0, 0.0]
         self.current_linear = [0.0, 0.0, 0.0]
@@ -39,122 +34,132 @@ class TeleopBridge(Node):
         self.uf_traj_pub = self.create_publisher(JointTrajectory, '/uf_controller/joint_trajectory', 10)
         self.tool_pub = self.create_publisher(Int8, 'tool_cmd', 10)
 
-        # --- Servo Clients ---
-        self.xarm_start_cli = self.create_client(Trigger, '/xarm_servo_node/start_servo')
-        self.uf_start_cli = self.create_client(Trigger, '/uf_servo_node/start_servo')
+        # --- Service Clients ---
+        self.cm_client = self.create_client(SwitchController, '/controller_manager/switch_controller')
+        self.srv_clients = {
+            'xarm_start': self.create_client(Trigger, '/xarm_servo_node/start_servo'),
+            'uf_start':   self.create_client(Trigger, '/uf_servo_node/start_servo'),
+        }
+
         self.joy_sub = self.create_subscription(Joy, '/joy', self.joy_callback, 10)
-        
         self.last_buttons = [0] * 12
+        
+        # --- Internal States ---
         self.gripper_is_closed = False
         self.unscrew_active = False
         self.grab_active = False
         self.deadman_active = False
         
-        # 🔄 Timers
-        self.create_timer(0.5, self.force_sync)
-        # 🚀 50Hz Streamer with built-in EMA Smoothing
         self.create_timer(0.02, self.continuous_twist_publisher)
+        self.sync_timer = self.create_timer(2.0, self.initial_sync_timer_callback)
 
-        self.get_logger().info("🧈 TELEOP BRIDGE: Cinematic Smoothing Active")
+        self.get_logger().info("🦾 DISASSEMBLY MASTER BRIDGE: R1 Gripper Mapping Online")
 
-    def force_sync(self):
-        req = Trigger.Request()
-        if not self.deadman_active:
-            if self.xarm_start_cli.wait_for_service(timeout_sec=0.1): self.xarm_start_cli.call_async(req)
-            if self.uf_start_cli.wait_for_service(timeout_sec=0.1): self.uf_start_cli.call_async(req)
+    def initial_sync_timer_callback(self):
+        self.manage_servo_nodes()
+        self.sync_timer.cancel()
 
-    def send_traj_goal(self, publisher, joint_names, positions, time_sec=1.5):
-        msg = JointTrajectory()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.joint_names = joint_names
-        point = JointTrajectoryPoint()
-        point.positions = [float(p) for p in positions]
-        point.time_from_start = Duration(sec=0, nanosec=int(time_sec * 1e9))
-        msg.points.append(point)
-        publisher.publish(msg)
+    def manage_servo_nodes(self):
+        """Switches hardware controllers and starts servo nodes for the active arm."""
+        if not self.cm_client.wait_for_service(timeout_sec=1.0): return
 
-    def apply_minimum_velocity(self, val):
-        if abs(val) < self.joystick_deadband: return 0.0
-        if abs(val) < self.min_velocity_boost:
-            return self.min_velocity_boost if val > 0 else -self.min_velocity_boost
-        return val
+        sw_req = SwitchController.Request()
+        sw_req.strictness = SwitchController.Request.BEST_EFFORT
+        
+        if self.active_arm == 'xarm':
+            print("\n" + "="*40)
+            print("🚀 ACTIVE ARM: XARM (Tool Arm / Slider)")
+            print("="*40)
+            sw_req.activate_controllers = ['xarm_controller', 'slider_controller']
+            sw_req.deactivate_controllers = ['uf_controller']
+            self.srv_clients['xarm_start'].call_async(Trigger.Request())
+        else:
+            print("\n" + "="*40)
+            print("🚀 ACTIVE ARM: UF850 (Manipulator Arm)")
+            print("="*40)
+            sw_req.activate_controllers = ['uf_controller']
+            sw_req.deactivate_controllers = ['xarm_controller', 'slider_controller']
+            self.srv_clients['uf_start'].call_async(Trigger.Request())
+
+        self.cm_client.call_async(sw_req)
 
     def joy_callback(self, msg):
         try:
-            btns = list(msg.buttons) + [0] * max(0, 12 - len(msg.buttons))
-            axes = list(msg.axes) + [0.0] * max(0, 8 - len(msg.axes))
+            btns = list(msg.buttons) + [0] * (12 - len(msg.buttons))
+            axes = list(msg.axes) + [0.0] * (8 - len(msg.axes))
 
+            # --- 🏠 BTN 3 (Y): HOMING ---
             if btns[3] == 1 and self.last_buttons[3] == 0:
-                self.send_traj_goal(self.xarm_traj_pub, 
-                    ['xarm5_joint1', 'xarm5_joint2', 'xarm5_joint3', 'xarm5_joint4', 'xarm5_joint5'],
-                    [0.0, 0.0, -1.5708, 1.5708, 0.0])
-                self.send_traj_goal(self.uf_traj_pub,
-                    ['u1_joint1', 'u1_joint2', 'u1_joint3', 'u1_joint4', 'u1_joint5', 'u1_joint6'],
-                    [0.0, 0.0, -1.5708, 0.0, -1.5708, 0.0])
+                print("🏠 [Command] Homing both arms to disassembly pose...")
+                self.send_traj_goal(self.xarm_traj_pub, ['xarm5_joint1', 'xarm5_joint2', 'xarm5_joint3', 'xarm5_joint4', 'xarm5_joint5'], [0.0, 0.0, -1.57, 1.57, 0.0])
+                self.send_traj_goal(self.uf_traj_pub, ['u1_joint1', 'u1_joint2', 'u1_joint3', 'u1_joint4', 'u1_joint5', 'u1_joint6'], [0.0, 0.0, -1.57, 0.0, -1.57, 0.0])
 
-            if btns[5] == 1 and self.last_buttons[5] == 0:
-                self.gripper_is_closed = not self.gripper_is_closed
-                self.send_traj_goal(self.gripper_traj_pub, ['rg6_l_out'], [-0.6 if self.gripper_is_closed else 0.6], time_sec=0.5)
+            # --- 📦 BTN 1 (B): GRAB / RELEASE (2/3) ---
+            if btns[1] == 1 and self.last_buttons[1] == 0:
+                self.grab_active = not self.grab_active
+                cmd = 2 if self.grab_active else 3
+                self.tool_pub.publish(Int8(data=cmd))
+                print(f"🗜️ [Tool] {'GRAB (2)' if self.grab_active else 'RELEASE (3)'}")
 
+            # --- 🔩 BTN 2 (X): UNSCREW / STOP (-1/0) ---
+            if btns[2] == 1 and self.last_buttons[2] == 0:
+                self.unscrew_active = not self.unscrew_active
+                cmd = -1 if self.unscrew_active else 0
+                self.tool_pub.publish(Int8(data=cmd))
+                print(f"⚙️ [Tool] {'UNSCREW (-1)' if self.unscrew_active else 'STOP (0)'}")
+
+            # --- 🔄 BTN 4 (L1): SWAP ROBOT ---
             if btns[4] == 1 and self.last_buttons[4] == 0:
                 self.active_arm = 'uf' if self.active_arm == 'xarm' else 'xarm'
-                self.get_logger().info(f"🦾 Active Arm Swapped to: {self.active_arm.upper()}")
+                self.manage_servo_nodes()
 
-            # 🎯 Capture the raw TARGET speed based on the joystick
+            # --- 🛠️ BTN 5 (R1): GRIPPER OPEN / CLOSE ---
+            if btns[5] == 1 and self.last_buttons[5] == 0:
+                self.gripper_is_closed = not self.gripper_is_closed
+                pos = -0.6 if self.gripper_is_closed else 0.6
+                print(f"🧤 [Gripper] {'CLOSING (-0.6)' if self.gripper_is_closed else 'OPENING (0.6)'}")
+                self.send_traj_goal(self.gripper_traj_pub, ['rg6_l_out'], [pos], duration=0.6)
+
+            # --- 🕹️ BTN 0 (A): DEADMAN SWITCH ---
             if btns[0] == 1:
                 self.deadman_active = True
-                self.target_linear[0] = self.apply_minimum_velocity(axes[1]) * self.linear_scale
-                self.target_linear[1] = self.apply_minimum_velocity(axes[0]) * self.linear_scale
-                self.target_linear[2] = self.apply_minimum_velocity(axes[4]) * self.linear_scale
-                self.target_angular[2] = self.apply_minimum_velocity(axes[3]) * self.angular_scale
-                
+                self.target_linear = [axes[1] * self.linear_scale, axes[0] * self.linear_scale, axes[4] * self.linear_scale]
+                self.target_angular[2] = axes[3] * self.angular_scale
                 if self.active_arm == 'uf':
-                    self.target_angular[1] = self.apply_minimum_velocity(axes[7]) * self.angular_scale 
-                    self.target_angular[0] = self.apply_minimum_velocity(axes[6]) * self.angular_scale 
-                else:
-                    self.target_angular[1] = 0.0
-                    self.target_angular[0] = 0.0
+                    # D-pad controls for UF850 Pitch/Roll
+                    self.target_angular[1] = axes[7] * self.angular_scale
+                    self.target_angular[0] = axes[6] * self.angular_scale
             else:
                 self.deadman_active = False
-                # If button is released, target speed drops to exactly zero
-                self.target_linear = [0.0, 0.0, 0.0]
-                self.target_angular = [0.0, 0.0, 0.0]
+                self.target_linear, self.target_angular = [0.0]*3, [0.0]*3
 
             self.last_buttons = list(btns)
-            
-        except Exception as e:
-            self.get_logger().error(f"❌ JOY CALLBACK CRASHED: {e}")
+        except Exception as e: self.get_logger().error(f"Joy Error: {e}")
 
     def continuous_twist_publisher(self):
-        """Runs cleanly at 50Hz, slowly ramping current speed towards target speed."""
-        
-        # Apply the Exponential Moving Average Math
         for i in range(3):
             self.current_linear[i] = (self.joystick_alpha * self.target_linear[i]) + ((1.0 - self.joystick_alpha) * self.current_linear[i])
             self.current_angular[i] = (self.joystick_alpha * self.target_angular[i]) + ((1.0 - self.joystick_alpha) * self.current_angular[i])
 
-        # If we are moving even microscopically, publish the Twist
-        # (This allows the robot to "coast" to a smooth stop after you let go)
         if self.deadman_active or any(abs(v) > 0.001 for v in self.current_linear + self.current_angular):
             tw = TwistStamped()
-            tw.header.stamp = self.get_clock().now().to_msg()
-            tw.header.frame_id = self.planning_frame
-            tw.twist.linear.x = self.current_linear[0]
-            tw.twist.linear.y = self.current_linear[1]
-            tw.twist.linear.z = self.current_linear[2]
-            tw.twist.angular.x = self.current_angular[0]
-            tw.twist.angular.y = self.current_angular[1]
-            tw.twist.angular.z = self.current_angular[2]
+            tw.header.stamp, tw.header.frame_id = self.get_clock().now().to_msg(), self.planning_frame
+            tw.twist.linear.x, tw.twist.linear.y, tw.twist.linear.z = self.current_linear
+            tw.twist.angular.x, tw.twist.angular.y, tw.twist.angular.z = self.current_angular
+            (self.xarm_pub if self.active_arm == 'xarm' else self.uf_pub).publish(tw)
 
-            if self.active_arm == 'xarm':
-                self.xarm_pub.publish(tw)
-            else:
-                self.uf_pub.publish(tw)
+    def send_traj_goal(self, publisher, names, positions, duration=4.0):
+        msg = JointTrajectory()
+        msg.joint_names = names
+        point = JointTrajectoryPoint()
+        point.positions = [float(p) for p in positions]
+        point.time_from_start = rclpy.duration.Duration(seconds=duration).to_msg()
+        msg.points.append(point)
+        publisher.publish(msg)
 
 def main(args=None):
     rclpy.init(args=args)
     rclpy.spin(TeleopBridge())
     rclpy.shutdown()
 
-if __name__ == '__main__':
-    main()
+if __name__ == '__main__': main()

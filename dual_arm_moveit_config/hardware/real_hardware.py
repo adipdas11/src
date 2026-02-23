@@ -2,11 +2,9 @@
 import rclpy
 from rclpy.node import Node
 from rclpy.callback_groups import ReentrantCallbackGroup
-from rclpy.executors import MultiThreadedExecutor
 from sensor_msgs.msg import JointState
-from geometry_msgs.msg import Twist
 from std_msgs.msg import Int8
-from std_srvs.srv import Empty, SetBool
+from std_srvs.srv import Trigger 
 from xarm.wrapper import XArmAPI
 from pymodbus.client.sync import ModbusTcpClient as ModbusClient
 import time
@@ -19,13 +17,8 @@ XARM_IP = '192.168.1.239'
 UF850_IP = '192.168.1.195'     
 GRIPPER_IP = '192.168.1.1'    
 
-# Logic: 0.6 = Open (160mm), -0.6 = Closed (0mm)
 RAD_OPEN = 0.6; RAD_CLOSE = -0.6; RAD_RANGE = RAD_OPEN - RAD_CLOSE
 MM_CLOSE = 0.0; MM_OPEN = 160.0      
-
-# 🛡️ SAFETY FIREWALL LIMIT
-# If ROS commands an instant jump larger than this, the driver blocks it.
-# 0.4 radians is approx 22 degrees. A real robot cannot move this fast in 0.01s.
 MAX_RAD_JUMP = 0.4  
 
 class RG:
@@ -63,9 +56,12 @@ class RealRobotInterface:
         self.prev_time = time.time()
         self.vel_window_size = 5 
         self.vel_history = [[0.0] * self.dof for _ in range(self.vel_window_size)]
+        
+        # 🛡️ TORQUE FILTER SETTINGS
         self.prev_eff = [0.0] * self.dof
-        self.torque_deadband = 0.08  
-        self.eff_alpha = 0.15         
+        self.torque_deadband = 0.15   # Ignores jitter below 0.15 N*m
+        self.eff_alpha = 0.08          # 0.08 = Strong smoothing for stable signals
+        
         self.connect()
     
     def connect(self):
@@ -73,20 +69,16 @@ class RealRobotInterface:
             self.arm.connect()
             self.arm.motion_enable(enable=True)
             self.arm.clean_error()
-            
-            # ==========================================
-            # 🛑 THE FIX: SWITCH TO SERVO MODE (MODE 6)
-            # ==========================================
             self.arm.set_mode(1) 
             self.arm.set_state(0)
-            self.arm.set_report_tau_or_i(0)
+            self.arm.set_report_tau_or_i(1) # Enable SDK torque report
             
             if self.has_linear_track: 
-                self.logger.info(f"⚙️ Calibrating {self.name} Linear Track. Moving to origin...")
+                self.logger.info(f"⚙️ Calibrating {self.name} Linear Track...")
                 self.arm.set_linear_track_enable(True)
                 self.arm.set_linear_track_back_origin(wait=True) 
                 self.arm.set_linear_track_speed(200)
-                self.logger.info(f"✅ {self.name} Linear Track homed successfully.")
+                self.logger.info(f"✅ {self.name} Linear Track homed.")
                 
             self.connected=True
         except Exception as e: 
@@ -99,10 +91,11 @@ class RealRobotInterface:
             code_p, pos = self.arm.get_servo_angle(is_radian=True)
             code_t, effort = self.arm.get_joints_torque()
             
-            if code_p == 0 and code_t == 0 and pos:
+            if code_p == 0 and code_t == 0 and pos and effort:
                 curr_pos = pos[:self.dof]
                 raw_eff = effort[:self.dof]
                 
+                # --- VELOCITY CALCULATION ---
                 curr_vel = [0.0] * self.dof
                 if dt > 0.001:
                     inst_vel = [(curr_pos[i] - self.prev_pos[i]) / dt for i in range(self.dof)]
@@ -110,11 +103,15 @@ class RealRobotInterface:
                     for i in range(self.dof):
                         curr_vel[i] = sum(h[i] for h in self.vel_history) / self.vel_window_size
                 
+                # --- [STAGE 1 & 2: DEADBAND + EMA SMOOTHING] ---
                 stable_eff = []
                 for i in range(self.dof):
-                    if abs(raw_eff[i] - self.prev_eff[i]) < self.torque_deadband: val = self.prev_eff[i]
-                    else: val = (self.eff_alpha * raw_eff[i]) + ((1 - self.eff_alpha) * self.prev_eff[i])
-                    stable_eff.append(val)
+                    # 1. Deadband logic
+                    raw_val = raw_eff[i] if abs(raw_eff[i]) > self.torque_deadband else 0.0
+                    # 2. EMA Filter logic
+                    smoothed_val = (self.eff_alpha * raw_val) + ((1 - self.eff_alpha) * self.prev_eff[i])
+                    # 3. Round to 3 decimal places for ROS scannability
+                    stable_eff.append(round(float(smoothed_val), 3))
 
                 self.prev_pos = curr_pos; self.prev_eff = stable_eff; self.prev_time = now
                 return (curr_pos, curr_vel, stable_eff)
@@ -125,7 +122,8 @@ class RealRobotInterface:
         if self.connected: self.arm.set_servo_angle_j(angles=angles, is_radian=True)
 
     def set_linear_track(self, pos_meters):
-        if self.connected and self.has_linear_track: self.arm.set_linear_track_pos(abs(pos_meters)*1000.0, wait=False)
+        if self.connected and self.has_linear_track: 
+            self.arm.set_linear_track_pos(abs(pos_meters)*1000.0, wait=False)
 
 class RealHardware(Node):
     def __init__(self):
@@ -139,7 +137,9 @@ class RealHardware(Node):
             self.xarm = RealRobotInterface(XARM_IP, "xArm5", 5, self.get_logger(), has_linear_track=True)
             self.uf850 = RealRobotInterface(UF850_IP, "UF850", 6, self.get_logger())
             self.gripper = RG('rg6', GRIPPER_IP, self.get_logger())
-        except Exception: sys.exit(1)
+        except Exception: 
+            self.get_logger().error("❌ HARDWARE INIT FAILED")
+            sys.exit(1)
 
         self.publisher_ = self.create_publisher(JointState, '/robot_joint_states', 50)
         self.cmd_sub = self.create_subscription(JointState, '/robot_joint_commands', self.joint_command_callback, 10, callback_group=self.cb_group)
@@ -151,45 +151,80 @@ class RealHardware(Node):
         self.get_logger().info("⏳ STEP 1: Syncing hardware pose...")
         while rclpy.ok():
             x_p, _, _ = self.xarm.get_full_state()
-            u_p, _, _ = self.uf850.get_full_state()
             if sum([abs(v) for v in x_p]) > 0.01:
-                self.get_logger().info("✅ STEP 2: Pose acquired. Flooding at 100Hz...")
-                for _ in range(200): 
+                self.get_logger().info("✅ STEP 2: Pose acquired. Flooding...")
+                for _ in range(100): 
                     self.publish_real_states()
                     time.sleep(0.01)
                 self.initial_sync_complete = True
-                
-                # 🛑 THE FIX: Change 0.02 to 0.01 to match MoveIt's 100Hz rate
                 self.timer = self.create_timer(0.01, self.publish_real_states, callback_group=self.cb_group) 
-                
-                self.get_logger().info("🟢 STEP 3: Driver LIVE. Hardware Safety Filters ACTIVE.")
+                self.get_logger().info("🟢 STEP 3: Driver LIVE. Filtered Torque Reporting ACTIVE.")
                 return
             time.sleep(0.5)
 
     def publish_real_states(self):
-        x_p, x_v, x_e = self.xarm.get_full_state()
-        u_p, u_v, u_e = self.uf850.get_full_state()
-        
-        self.loop_count += 1
-        if self.gripper and self.loop_count >= 10:
-            try: self.cached_gripper_width = self.gripper.get_width()
-            except: pass
-            self.loop_count = 0
+        try:
+            x_p, x_v, x_e = self.xarm.get_full_state()
+            u_p, u_v, u_e = self.uf850.get_full_state()
             
-        g = self.mm_to_rad(self.cached_gripper_width)
-        c, s_raw = self.xarm.arm.get_linear_track_pos() if self.xarm else (0, 0.0)
-        s = -1.0 * (s_raw / 1000.0) if c == 0 else 0.0
-        
-        msg = JointState(); msg.header.stamp = self.get_clock().now().to_msg()
-        msg.name = [
-            'xarm5_joint1', 'xarm5_joint2', 'xarm5_joint3', 'xarm5_joint4', 'xarm5_joint5', 
-            'u1_joint1', 'u1_joint2', 'u1_joint3', 'u1_joint4', 'u1_joint5', 'u1_joint6', 
-            'slider_slider_joint', 'rg6_l_out', 'rg6_r_out', 'rg6_l_tip', 'rg6_r_tip', 'rg6_l_passive', 'rg6_r_passive'
-        ]
-        msg.position = x_p + u_p + [s] + [g, -g, g, -g, -g, -g]
-        msg.velocity = x_v + u_v + [0.0] + [0.0]*6
-        msg.effort = x_e + u_e + [0.0] + [0.0]*6
-        self.publisher_.publish(msg)
+            # --- Gripper/Slider tracking ---
+            self.loop_count += 1
+            if self.gripper and self.loop_count >= 10:
+                try: self.cached_gripper_width = self.gripper.get_width()
+                except: pass
+                self.loop_count = 0
+                
+            g_pos = self.mm_to_rad(self.cached_gripper_width)
+            c, s_raw = self.xarm.arm.get_linear_track_pos() if self.xarm else (0, 0.0)
+            s_pos = -1.0 * (s_raw / 1000.0) if c == 0 else 0.0
+            
+            msg = JointState()
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.header.frame_id = "base_link"
+
+            # 🛑 MANUAL MAPPING TO MATCH YOUR TOPIC ECHO ORDER
+            # The order here must match exactly what you see in 'ros2 topic echo'
+            mapping = [
+                ('xarm5_joint1', x_p[0], x_e[0]),
+                ('xarm5_joint2', x_p[1], x_e[1]),
+                ('slider_slider_joint', s_pos, 0.0),
+                ('xarm5_joint5', x_p[4], x_e[4]),
+                ('xarm5_joint3', x_p[2], x_e[2]),
+                ('u1_joint1',    u_p[0], u_e[0]),
+                ('u1_joint2',    u_p[1], u_e[1]),
+                ('u1_joint3',    u_p[2], u_e[2]),
+                ('xarm5_joint4', x_p[3], x_e[3]),
+                ('u1_joint4',    u_p[3], u_e[3]),
+                ('u1_joint5',    u_p[4], u_e[4]),
+                ('u1_joint6',    u_p[5], u_e[5]),
+                ('rg6_l_out',    g_pos, 0.0)
+            ]
+
+            msg.name = [m[0] for m in mapping]
+            msg.position = [float(m[1]) for m in mapping]
+            msg.velocity = [0.0] * len(mapping)
+
+            # 🛡️ THE FINAL ROUNDING FILTER (FORCED)
+            clean_efforts = []
+            for m in mapping:
+                raw_val = float(m[2])
+                # Hard Deadband
+                if abs(raw_val) < 0.15:
+                    clean_efforts.append(0.0)
+                else:
+                    # Forced rounding to 3 decimal places
+                    clean_efforts.append(float(f"{raw_val:.3f}"))
+            
+            msg.effort = clean_efforts
+            
+            # This logger will prove if the new code is running
+            if self.loop_count == 0:
+                self.get_logger().info("⚠️ PUBLISHER ROUNDING ACTIVE", once=True)
+
+            self.publisher_.publish(msg)
+
+        except Exception as e:
+            self.get_logger().error(f"Mapping Error: {e}")
 
     def joint_command_callback(self, msg):
         if self.velocity_mode_active or not self.initial_sync_complete: return
@@ -201,27 +236,15 @@ class RealHardware(Node):
             elif 'slider_slider_joint' == name: slider_cmd = msg.position[i]
             elif 'rg6_l_out' == name: gripper_cmd = msg.position[i]
 
-        # ====================================================================
-        # 🛡️ HARDWARE SAFETY FIREWALL: Reject massive jumps (Snap-to-Zero fix)
-        # ====================================================================
         if all(c is not None for c in xarm_cmds) and self.xarm.connected:
             curr_x, _, _ = self.xarm.get_full_state()
-            for idx, (curr, cmd) in enumerate(zip(curr_x, xarm_cmds)):
-                if abs(curr - cmd) > MAX_RAD_JUMP:
-                    # self.get_logger().error(f"🚨 BLOCKED XARM JUMP! Joint {idx+1} commanded to jump from {curr:.2f} to {cmd:.2f}. Command DROPPED.")
-                    return # Abort entire command sequence to save the hardware
-            
-            self.xarm.set_servo_angle(xarm_cmds)
+            if all(abs(curr - cmd) < MAX_RAD_JUMP for curr, cmd in zip(curr_x, xarm_cmds)):
+                self.xarm.set_servo_angle(xarm_cmds)
 
         if all(c is not None for c in uf_cmds) and self.uf850.connected:
             curr_u, _, _ = self.uf850.get_full_state()
-            for idx, (curr, cmd) in enumerate(zip(curr_u, uf_cmds)):
-                if abs(curr - cmd) > MAX_RAD_JUMP:
-                    # self.get_logger().error(f"🚨 BLOCKED UF850 JUMP! Joint {idx+1} commanded to jump from {curr:.2f} to {cmd:.2f}. Command DROPPED.")
-                    return # Abort entire command sequence to save the hardware
-            
-            self.uf850.set_servo_angle(uf_cmds)
-        # ====================================================================
+            if all(abs(curr - cmd) < MAX_RAD_JUMP for curr, cmd in zip(curr_u, uf_cmds)):
+                self.uf850.set_servo_angle(uf_cmds)
 
         if slider_cmd is not None: self.xarm.set_linear_track(slider_cmd)
         if gripper_cmd is not None and abs(gripper_cmd - self.last_gripper_cmd) > 0.01:
@@ -230,26 +253,6 @@ class RealHardware(Node):
 
     def rad_to_mm(self, rad): return max(0.0, min(MM_OPEN, ((rad - RAD_CLOSE)/RAD_RANGE)*MM_OPEN))
     def mm_to_rad(self, mm): return ((mm/MM_OPEN)*RAD_RANGE)+RAD_CLOSE
-
-    def handle_velocity_mode_request(self, request, response):
-        if request.data: 
-            self.xarm.arm.set_mode(5)
-            self.xarm.arm.set_state(0)
-            self.velocity_mode_active = True
-        else: 
-            # 🛑 Ensure it returns to Mode 6 when toggling off
-            self.xarm.arm.set_mode(6)
-            self.xarm.arm.set_state(0)
-            self.velocity_mode_active = False
-        response.success = True
-        return response
-
-    def handle_velocity_command(self, msg):
-        if self.velocity_mode_active:
-            self.xarm.arm.vc_set_cartesian_velocity([msg.linear.x*1000, msg.linear.y*1000, msg.linear.z*1000, 0, 0, math.degrees(msg.angular.z)])
-
-    def handle_stop_request(self, req, res): self.xarm.arm.set_state(4); self.uf850.arm.set_state(4); return res
-    def handle_reset_request(self, req, res): self.xarm.connect(); self.uf850.connect(); return res
 
 def main(args=None):
     rclpy.init(args=args); node = RealHardware()

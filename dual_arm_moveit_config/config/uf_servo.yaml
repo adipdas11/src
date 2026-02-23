@@ -2,9 +2,9 @@
 # UF850 Servo Configuration
 ###############################################
 use_gazebo: false
-command_in_type: "speed_units"
+command_in_type: unitless
 scale:
-  linear:  0.5  
+  linear:  0.8  
   rotational:  0.8 
   joint: 0.5 
 

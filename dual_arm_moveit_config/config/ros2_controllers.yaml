@@ -17,6 +17,13 @@ controller_manager:
     slider_controller:
       type: joint_trajectory_controller/JointTrajectoryController
 
+joint_state_broadcaster:
+  ros__parameters:
+    interfaces:
+      - position
+      - velocity
+      - effort
+
 xarm_controller:
   ros__parameters:
     joints:
@@ -30,7 +37,6 @@ xarm_controller:
     state_interfaces:
       - position
       - velocity
-    # 🛑 THE FIX: Allow fluid motion between Servo commands
     open_loop_control: true
     allow_nonzero_velocity_at_trajectory_end: true
 
@@ -48,7 +54,6 @@ uf_controller:
     state_interfaces:
       - position
       - velocity
-    # 🛑 THE FIX: Allow fluid motion between Servo commands
     open_loop_control: true
     allow_nonzero_velocity_at_trajectory_end: true
 
