@@ -77,7 +77,7 @@ class UnscrewSkill(Node):
         self.EXTRACTION_WIGGLE_AMP = 0.0015 
         self.EXTRACTION_WIGGLE_SPEED = 15.0 
         self.RETRY_RETRACT = 0.020     
-        self.HOLE_CONFIRM_LIMIT = 5    # Consecutive frames required to confirm a missing screw
+        self.HOLE_CONFIRM_LIMIT = 5   
         
         # --- Force & Tactile Thresholds ---
         self.UNSCREW_RELIEF_STEP = 0.001 

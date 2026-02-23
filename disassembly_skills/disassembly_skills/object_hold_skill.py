@@ -327,6 +327,16 @@ class ObjectHoldSkill(Node):
         if interactive: input(f"\n🚀 STEP 1: Move to SAFE HOVER Position? [Enter]")
         self.gripper.move_to_joint_positions({self.JOINT_GRIPPER: math.radians(self.OPEN_DEG)}, "rg6", velocity=self.GRIPPER_SPEED)
         self.wait_for_gripper(self.OPEN_DEG)
+
+        # --- NEW VERIFICATION CHECK: Confirm the jaws actually opened ---
+        current_jaws_pos = self.gripper.current_joint_positions.get(self.JOINT_GRIPPER, 999)
+        # We allow a small error margin of ~4.5 degrees (0.08 radians)
+        if current_jaws_pos == 999 or abs(current_jaws_pos - math.radians(self.OPEN_DEG)) > 0.08:
+            self.get_logger().error(f"❌ HARDWARE ERROR: Gripper failed to open completely! Aborting sequence.")
+            self.publish_state("ERROR")
+            return False
+        # ----------------------------------------------------------------
+
         self.uf850.move_to_pose_robust(target_x, target_y, hover_z, q_dict, link_name=self.ROBOT_EE_LINK, velocity=0.1)
 
         # Step 2: First descent to find the table/base level

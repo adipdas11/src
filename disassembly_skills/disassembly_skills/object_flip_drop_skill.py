@@ -28,9 +28,7 @@ class FlipDropSkill(Node):
         self.last_logged_status = None  
         self.hold_event = threading.Event()
         
-        # Updated to listen to the new Central State Manager!
         self.create_subscription(Bool, '/object_hold_state/is_held', self.hold_status_callback, 10)
-        
         self.state_update_pub = self.create_publisher(String, '/robot_state/manip_arm/update', 10)
         
         self.get_logger().info("🚀 Flip Drop (Shake) Skill Node Active.")
@@ -48,21 +46,18 @@ class FlipDropSkill(Node):
         
         self.RETRACT_Z_HEIGHT = 0.15           # 15cm Retract at the starting location
         
-        # --- INTERMEDIATE FLIP ZONE POSE (From Image) ---
         self.INTERMEDIATE_POSE = {
             'x': 0.929872, 'y': -0.633943, 'z': 1.0977,
             'qx': -0.495652, 'qy': -0.505050, 'qz': -0.491028, 'qw': 0.508080
         }
 
-        # --- Shake / Wiggle Configuration ---
-        self.WIGGLE_Z_DIST = 0.02              # 2cm up and down movement
-        self.WIGGLE_SPEED = 100.0              # Fast cartesian speed for snapping motion
-        self.WIGGLE_CYCLES = 2                 # Number of up-down bounces
+        self.WIGGLE_Z_DIST = 0.02              
+        self.WIGGLE_SPEED = 100.0              
+        self.WIGGLE_CYCLES = 2                 
         
-        # --- Tactile Feedback Configuration ---
         self.CONTACT_JOINT = "u1_joint5"       
         self.TORQUE_THRESHOLD = 2.0            
-        self.RETRACT_DISTANCE = 0.005          # 5mm Retract after hitting the table
+        self.RETRACT_DISTANCE = 0.005          
         # =====================================================================
 
     def publish_state(self, state_str: str):
@@ -106,20 +101,28 @@ class FlipDropSkill(Node):
 
     def descend_until_contact(self):
         self.publish_state("MOVING") 
+        
+        # --- FIX: Dynamic Baseline Calibration (Accounts for object weight) ---
+        time.sleep(0.2) 
+        baseline_effort = self.uf850.current_joint_efforts.get(self.CONTACT_JOINT, 0.0)
+        self.get_logger().info(f"📊 Baseline established for {self.CONTACT_JOINT} (with payload): {baseline_effort:.4f} Nm")
+
         self.get_logger().info(f"⬇️ Starting Native SDK Tactile Descent (Target Joint: {self.CONTACT_JOINT})")
         self.contact_detected = False
         last_print_time = time.time()
 
         def check_force():
             nonlocal last_print_time
-            effort = self.uf850.current_joint_efforts.get(self.CONTACT_JOINT, -99.0)
+            current_effort = self.uf850.current_joint_efforts.get(self.CONTACT_JOINT, 0.0)
+            
+            # Measure strictly against the calibrated weight of the object
+            actual_spike = abs(current_effort - baseline_effort)
             
             if time.time() - last_print_time > 0.1:
-                print(f"   [Live Debug] Current {self.CONTACT_JOINT} Effort: {effort:.4f} Nm")
                 last_print_time = time.time()
 
-            if effort > self.TORQUE_THRESHOLD:
-                self.get_logger().warn(f"💥 THRESHOLD CROSSED! Actual Spike: {effort:.4f} Nm")
+            if actual_spike > self.TORQUE_THRESHOLD:
+                self.get_logger().warn(f"💥 THRESHOLD CROSSED! Actual Spike: {actual_spike:.4f} Nm")
                 self.contact_detected = True
                 return True 
             return False
@@ -152,19 +155,14 @@ class FlipDropSkill(Node):
         return True
 
     def execute_flip_drop(self, interactive=False):
-        """
-        Main state machine for the Flip Drop operation. 
-        """
         print("\n" + "!"*60)
         print("🤖 INITIATING FLIP DROP (SHAKE) SKILL")
         print("!"*60)
 
-        # --- Hard Check against library-mode execution when empty ---
         if not self.is_holding_object:
             self.get_logger().error("❌ Aborting: The State Manager reports the gripper is EMPTY.")
             return False
 
-        # 1. Capture Original Data
         orig_pos, orig_quat = self.get_current_tcp_pose()
         if not orig_pos or not orig_quat:
             self.get_logger().error("❌ Failed to get current TCP pose.")
@@ -182,7 +180,7 @@ class FlipDropSkill(Node):
             link_name=self.ROBOT_EE_LINK, velocity=0.1, frame_id=self.PLANNING_FRAME
         )
 
-        # --- STEP 2: Move to Intermediate Pose (Maintaining Original Orientation) ---
+        # --- STEP 2: Move to Intermediate Pose ---
         if interactive: input(f"\n🚀 STEP 2: Move to Intermediate Flip Zone? [Enter]")
         self.get_logger().info("🔄 Moving to Flip Zone while maintaining picked orientation...")
         self.uf850.move_to_pose_robust(
@@ -202,7 +200,6 @@ class FlipDropSkill(Node):
             
         original_j6 = current_joints["u1_joint6"]
         
-        # 3A. Flip Upside Down (Anti-windup logic)
         if original_j6 > (math.pi / 2.0):
             self.get_logger().info("🔄 Flipping backward (-180°)...")
             current_joints["u1_joint6"] -= math.pi
@@ -211,15 +208,11 @@ class FlipDropSkill(Node):
             current_joints["u1_joint6"] += math.pi
         self.uf850.move_to_joint_positions(current_joints, filter_prefix="u1", velocity=0.1)
 
-        # 3B. Wiggle (Up / Down) via SDK
         self.get_logger().info("🪀 Performing up-down wiggle to shake out contents...")
         for _ in range(self.WIGGLE_CYCLES):
-            # Jog UP
             self.uf850.jog_cartesian_sdk(dx_m=0.0, dy_m=0.0, dz_m=self.WIGGLE_Z_DIST, speed_mm_s=self.WIGGLE_SPEED)
-            # Jog DOWN
             self.uf850.jog_cartesian_sdk(dx_m=0.0, dy_m=0.0, dz_m=-self.WIGGLE_Z_DIST, speed_mm_s=self.WIGGLE_SPEED)
 
-        # 3C. Un-Flip (Return to Original Orientation)
         self.get_logger().info("🔄 Flipping back to original upright orientation...")
         current_joints["u1_joint6"] = original_j6
         self.uf850.move_to_joint_positions(current_joints, filter_prefix="u1", velocity=0.1)
@@ -228,10 +221,15 @@ class FlipDropSkill(Node):
         self.publish_state("MOVING") 
         if interactive: input(f"\n🚀 STEP 4: Return to Original Zone? [Enter]")
         self.get_logger().info("🔄 Returning to original XY with original orientation...")
-        self.uf850.move_to_pose_robust(
+        
+        # Check success of MoveIt and use a raw SDK absolute fallback if it gets confused
+        success_return = self.uf850.move_to_pose_robust(
             orig_pos[0], orig_pos[1], orig_retract_z, q_dict_orig, 
             link_name=self.ROBOT_EE_LINK, velocity=0.1, frame_id=self.PLANNING_FRAME
         )
+        if not success_return:
+            self.get_logger().warn("⚠️ MoveIt failed to return. Forcing absolute SDK translation...")
+            self.uf850.move_to_absolute_pose_sdk(orig_pos[0], orig_pos[1], orig_retract_z, speed_mm_s=50.0)
 
         # --- STEP 5: Descent ---
         if interactive: input(f"\n🚀 STEP 5: Start SDK Tactile Descent? [Enter]")
@@ -245,7 +243,12 @@ class FlipDropSkill(Node):
         self.gripper.move_to_joint_positions({self.JOINT_GRIPPER: math.radians(self.OPEN_DEG)}, "rg6", velocity=self.GRIPPER_SPEED)
         self.wait_for_gripper(self.OPEN_DEG)
         
-        # Give the object half a second to fall completely free
+        current_jaws_pos = self.gripper.current_joint_positions.get(self.JOINT_GRIPPER, 999)
+        if current_jaws_pos == 999 or abs(current_jaws_pos - math.radians(self.OPEN_DEG)) > 0.08:
+            self.get_logger().error(f"❌ HARDWARE ERROR: Gripper failed to open completely! Aborting sequence.")
+            self.publish_state("ERROR")
+            return False
+        
         time.sleep(0.5)
 
         # --- STEP 7: Close Gripper ---
@@ -253,6 +256,12 @@ class FlipDropSkill(Node):
         self.get_logger().info("✊ Closing empty jaws...")
         self.gripper.move_to_joint_positions({self.JOINT_GRIPPER: math.radians(self.CLOSE_DEG)}, "rg6", velocity=self.GRIPPER_SPEED)
         self.wait_for_gripper(self.CLOSE_DEG)
+        
+        current_jaws_pos_close = self.gripper.current_joint_positions.get(self.JOINT_GRIPPER, 999)
+        if current_jaws_pos_close == 999 or abs(current_jaws_pos_close - math.radians(self.OPEN_DEG)) < 0.08:
+            self.get_logger().error(f"❌ HARDWARE ERROR: Gripper failed to close! Aborting sequence.")
+            self.publish_state("ERROR")
+            return False
         
         print("\n🎉 FLIP DROP SKILL COMPLETE: Object successfully shaken, dropped, and jaws closed.")
         self.publish_state("IDLE") 
@@ -276,13 +285,10 @@ def main(args=None):
         print("🕒 Waiting for State Manager to report HOLDING (/object_hold_state/is_held)...")
         print("="*60)
         
-        # Because the State Manager broadcasts at 2Hz, we must continuously ignore
-        # the "False" messages and wait until the gripper actually secures something.
         while rclpy.ok() and not flip_node.is_holding_object:
             flip_node.hold_event.clear()
             flip_node.hold_event.wait() 
         
-        # Once it breaks out of the loop, execute the skill!
         if rclpy.ok() and flip_node.is_holding_object:
             success = flip_node.execute_flip_drop(interactive=True)
             if success:

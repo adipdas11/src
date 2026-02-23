@@ -252,15 +252,7 @@ class MasterAgentNode(Node):
             ),
             "flip_drop": Tool(
                 self.flip_drop,
-                "Drops the unscrewed parts (e.g., a PCB after removing all its screws) to a designated location."
-            ),
-            "lift_and_drop": Tool(
-                self.lift_and_drop,
-                "Action failed, missing object_id or object_name parameter"
-            ),
-            "dummy": Tool(
-                self.dummy,
-                "A dummy tool for testing."
+                "Drops the unscrewed parts to a designated location."
             )
         }
 

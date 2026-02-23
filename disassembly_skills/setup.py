@@ -28,7 +28,9 @@ setup(
         ],
     },
     entry_points={
-        'console_scripts': [         
+        'console_scripts': [ 
+            'teleop_controller = disassembly_skills.teleop_controller:main',
+            'il_data_recorder = disassembly_skills.il_data_recorder:main',        
             'object_hold_skill = disassembly_skills.object_hold_skill:main',
             'unscrew_skill = disassembly_skills.unscrew_skill:main',
             'object_flip_skill = disassembly_skills.object_flip_skill:main',

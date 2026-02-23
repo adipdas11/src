@@ -1,38 +1,34 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <robot name="dual_arm_disassembly_cell">
+    
     <group name="xarm_arm">
-        <chain base_link="xarm5_base_link" tip_link="xarm5_tool0"/>
+        <chain base_link="xarm5_base_link" tip_link="screwdriver_tcp"/>
     </group>
 
     <group name="uf_arm">
-        <chain base_link="u1_base_link" tip_link="u1_tool0"/>
+        <chain base_link="u1_base_link" tip_link="rg6_hand_tcp"/>
     </group>
 
-      <group name="rg6_gripper">
+    <group name="rg6_gripper">
         <joint name="rg6_l_out"/>
-        <end_effector name="rg6_eef" parent_link="u1_tool0" group="rg6_gripper"/>
     </group>
 
     <group name="slider">
         <joint name="slider_slider_joint"/>
     </group>
 
-    <group name="xarm_arm">
-        <chain base_link="xarm5_base_link" tip_link="screwdriver_tcp"/>
-    </group>
-    <end_effector name="xarm_tcp" parent_link="screwdriver_tcp" group="xarm_arm"/>
-
-    <group name="uf_arm">
-        <chain base_link="u1_base_link" tip_link="rg6_hand_tcp"/>
-    </group>
-    <end_effector name="uf_tcp" parent_link="rg6_hand_tcp" group="uf_arm"/>
-
     <group name="dual_arms">
         <group name="xarm_arm"/>
         <group name="uf_arm"/>
         <group name="rg6_gripper"/>
-        <!-- <group name="slider"/> -->
+        <group name="slider"/> </group>
+
+    <group name="xarm_on_rail">
+        <group name="xarm_arm"/> 
+        <joint name="slider_slider_joint"/>
     </group>
+
+    <end_effector name="rg6_eef" parent_link="u1_tool0" group="rg6_gripper"/>
 
 
     <group_state name="home" group="dual_arms">
@@ -79,14 +75,10 @@
         <joint name="rg6_l_out" value="-0.6"/> 
     </group_state>
 
-
-    <group name="xarm_on_rail">
-        <group name="xarm_arm"/> <joint name="slider_slider_joint"/>
-    </group>
-
     <group_state name="home" group="slider">
         <joint name="slider_slider_joint" value="0.0"/>
     </group_state>
+
 
     <disable_collisions link1="rg6_base_link" link2="rg6_l_out" reason="Internal"/>
     <disable_collisions link1="rg6_base_link" link2="rg6_r_out" reason="Internal"/>

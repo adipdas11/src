@@ -266,6 +266,14 @@ class ObjectFlipSkill(Node):
         self.gripper.move_to_joint_positions({self.JOINT_GRIPPER: math.radians(self.OPEN_DEG)}, "rg6", velocity=self.GRIPPER_SPEED)
         self.wait_for_gripper(self.OPEN_DEG)
         
+        # --- NEW VERIFICATION CHECK: Confirm the jaws actually opened ---
+        current_jaws_pos = self.gripper.current_joint_positions.get(self.JOINT_GRIPPER, 999)
+        if current_jaws_pos == 999 or abs(current_jaws_pos - math.radians(self.OPEN_DEG)) > 0.08:
+            self.get_logger().error(f"❌ HARDWARE ERROR: Gripper failed to open completely! Aborting sequence.")
+            self.publish_state("ERROR")
+            return False
+        # ----------------------------------------------------------------
+        
         # Give the object half a second to settle perfectly flat
         self.publish_state("IDLE") # STATE UPDATE (Object is free on the table)
         time.sleep(0.5)
@@ -277,6 +285,15 @@ class ObjectFlipSkill(Node):
         self.gripper.move_to_joint_positions({self.JOINT_GRIPPER: math.radians(self.CLOSE_DEG)}, "rg6", velocity=self.GRIPPER_SPEED)
         is_held = self.wait_for_gripper(self.CLOSE_DEG)
         
+        # --- NEW VERIFICATION CHECK: Confirm the jaws actually actuated to close ---
+        current_jaws_pos_close = self.gripper.current_joint_positions.get(self.JOINT_GRIPPER, 999)
+        # If the gripper is still resting near the OPEN_DEG, it failed to actuate at all.
+        if current_jaws_pos_close == 999 or abs(current_jaws_pos_close - math.radians(self.OPEN_DEG)) < 0.08:
+            self.get_logger().error(f"❌ HARDWARE ERROR: Gripper failed to close! Aborting sequence.")
+            self.publish_state("ERROR")
+            return False
+        # ----------------------------------------------------------------
+
         if not is_held:
             self.get_logger().error("❌ Failed to re-grasp the object after flipping.")
             self.publish_state("ERROR") # STATE UPDATE
