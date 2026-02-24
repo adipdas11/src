@@ -16,8 +16,17 @@ class MotionBackend:
     def __init__(self, node: Node, group_name: str):
         self.node = node
         self.group_name = group_name
-        self.is_xarm5 = "xarm5" in group_name.lower()
-        self.prefix = 'xarm' if 'xarm' in self.group_name.lower() else 'uf'
+        
+        # 🦾 THE CRITICAL FIX: Ensure any mention of 'xarm' sets this to True
+        self.is_xarm5 = "xarm" in group_name.lower()
+        
+        # --- LOGGING FOR VERIFICATION ---
+        if self.is_xarm5:
+            self.node.get_logger().info("✅ MotionBackend: Initialized for XARM5 group.")
+        else:
+            self.node.get_logger().info("✅ MotionBackend: Initialized for UF850 group.")
+
+        self.prefix = 'xarm' if self.is_xarm5 else 'uf'
         self.controller_name = f"{self.prefix}_controller"
         
         # --- ROS 2 Interfaces ---
@@ -82,9 +91,9 @@ class MotionBackend:
         req.ik_request.avoid_collisions = True
         
         # 🦾 THE FIX: Strictly align the tip frame with what MoveIt expects
-        # Your log says only [screwdriver_tcp] is available for this group.
+        # Your log says only [xarm5_link5] is available for this group.
         if self.is_xarm5:
-            req.ik_request.ik_link_name = "screwdriver_tcp"
+            req.ik_request.ik_link_name = "xarm5_link5"
         else:
             req.ik_request.ik_link_name = "u1_tool0"
         
@@ -107,9 +116,9 @@ class MotionBackend:
             self._execute_joint_goal(ik_res.solution.joint_state, velocity)
             return True
 
-        # 5-DOF Yaw Sweep Fallback (screwdriver_tcp)
+        # 5-DOF Yaw Sweep Fallback (xarm5_link5)
         if self.is_xarm5:
-            self.node.get_logger().warn("⚠️ IK Failed for screwdriver_tcp. Attempting Yaw Sweep...")
+            self.node.get_logger().warn("⚠️ IK Failed for xarm5_link5. Attempting Yaw Sweep...")
             for yaw_deg in [15, -15, 30, -30, 45, -45, 90, -90, 180]:
                 yaw_rad = math.radians(yaw_deg)
                 ps.pose.orientation = self._rpy_to_quaternion(math.pi, 0.0, yaw_rad)
@@ -129,16 +138,19 @@ class MotionBackend:
         goal = MoveGroup.Goal()
         goal.request.group_name = self.group_name
         goal.request.max_velocity_scaling_factor = velocity
-        # 🦾 Ensure a valid planning time is set (Fixes "timeout must be positive" log)
-        goal.request.allowed_planning_time = 5.0
         
         constraints = Constraints()
-        # Look for the specific prefix in the incoming target_joints keys
-        pfx = 'xarm' if self.is_xarm5 else 'u1'
+        
+        # 🦾 DIRECT CHECK: Use the instance-specific flag set in __init__
+        if self.is_xarm5:
+            prefixes = ['xarm5', 'slider']
+        else:
+            prefixes = ['u1', 'rg6']
         
         found_joints = False
         for name, pos in target_joints.items():
-            if pfx in name:
+            # Check if current joint in target_joints matches the arm we are controlling
+            if any(name.startswith(pfx) for pfx in prefixes):
                 jc = JointConstraint()
                 jc.joint_name, jc.position, jc.weight = name, float(pos), 1.0
                 jc.tolerance_above = jc.tolerance_below = 0.01
@@ -146,7 +158,9 @@ class MotionBackend:
                 found_joints = True
         
         if not found_joints:
-            self.node.get_logger().error(f"❌ No joints found matching prefix {pfx}")
+            # This is where your error was triggered. 
+            # It means the 'prefixes' variable was ['u1', 'rg6'] even for the xArm.
+            self.node.get_logger().error(f"❌ Prefix mismatch: {prefixes} not found in target_joints.")
             return False
 
         goal.request.goal_constraints.append(constraints)
@@ -228,30 +242,55 @@ class MotionBackend:
             time.sleep(0.02)
         self.servo_pub.publish(TwistStamped())
         return True
-
-    # --- Utility Methods ---
+            
     def get_transformed_pose(self, source_pose, source_frame, target_frame, z_offset=0.0):
         try:
             p = PoseStamped()
-            p.header.frame_id, p.header.stamp = source_frame, self.node.get_clock().now().to_msg()
+            p.header.frame_id = source_frame
+            # 🦾 FIX: Use Time() (zero) to get the latest available transform
+            p.header.stamp = rclpy.time.Time().to_msg() 
+            
             p.pose = source_pose.pose if hasattr(source_pose, 'pose') else source_pose
-            if not self.tf_buffer.can_transform(target_frame, source_frame, rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=1.0)):
+            
+            # Check if transform is possible before attempting
+            if not self.tf_buffer.can_transform(target_frame, source_frame, rclpy.time.Time(), 
+                                              timeout=rclpy.duration.Duration(seconds=1.0)):
                 return None
+                
             t = self.tf_buffer.transform(p, target_frame)
             t.pose.position.z += z_offset
             return t
         except Exception as e:
-            self.node.get_logger().error(f"TF Error: {e}"); return None
+            self.node.get_logger().error(f"TF Error: {e}")
+            return None
 
     def _execute_joint_goal(self, js, vel):
-        goal = MoveGroup.Goal(); goal.request.group_name = self.group_name
+        """Standardizes joint execution across arms, grippers, and sliders."""
+        goal = MoveGroup.Goal()
+        goal.request.group_name = self.group_name
         goal.request.max_velocity_scaling_factor = vel
+        
         constraints = Constraints()
-        pfx = 'xarm5' if self.is_xarm5 else 'u1'
+        # 🦾 IMPROVED PREFIX LOGIC
+        # Logic: If it's an xarm task, take xarm+slider. If it's a UF task, take u1+rg6.
+        if self.is_xarm5:
+            prefixes = ['xarm5', 'slider']
+        else:
+            prefixes = ['u1', 'rg6']
+
+        found_any = False
         for n, p in zip(js.name, js.position):
-            if pfx in n:
-                jc = JointConstraint(); jc.joint_name, jc.position, jc.weight = n, p, 1.0
+            # Check if the joint name starts with any of our valid prefixes
+            if any(n.startswith(pfx) for pfx in prefixes):
+                jc = JointConstraint()
+                jc.joint_name, jc.position, jc.weight = n, p, 1.0
                 constraints.joint_constraints.append(jc)
+                found_any = True
+        
+        if not found_any:
+            self.node.get_logger().error(f"❌ No joints matching {prefixes} found in message!")
+            return
+
         goal.request.goal_constraints.append(constraints)
         self._action_client.send_goal_async(goal)
 

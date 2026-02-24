@@ -7,6 +7,7 @@ from geometry_msgs.msg import TwistStamped
 from std_msgs.msg import Int8
 from std_srvs.srv import Trigger
 from controller_manager_msgs.srv import SwitchController
+import time
 
 class TeleopBridge(Node):
     def __init__(self):
@@ -60,39 +61,62 @@ class TeleopBridge(Node):
         self.sync_timer.cancel()
 
     def manage_servo_nodes(self):
-        """Switches hardware controllers and starts servo nodes for the active arm."""
+        """Switches hardware controllers intelligently to avoid empty request warnings."""
         if not self.cm_client.wait_for_service(timeout_sec=1.0): return
 
-        sw_req = SwitchController.Request()
-        sw_req.strictness = SwitchController.Request.BEST_EFFORT
-        
+        # 🦾 SMART ACTIVATE: Only ask to activate what is currently INACTIVE
+        # This stops the "Controller is not inactive" warnings
+        try:
+            import subprocess
+            res = subprocess.run(['ros2', 'control', 'list_controllers'], capture_output=True, text=True)
+            controller_status = res.stdout
+        except Exception:
+            controller_status = ""
+
+        all_needed = ['xarm_controller', 'uf_controller', 'slider_controller', 'rg6_controller']
+        to_activate = [c for c in all_needed if f"{c:20} [inactive]" in controller_status]
+
+        if to_activate:
+            sw_req = SwitchController.Request()
+            sw_req.activate_controllers = to_activate
+            sw_req.deactivate_controllers = [] 
+            sw_req.strictness = SwitchController.Request.BEST_EFFORT
+            self.cm_client.call_async(sw_req)
+            self.get_logger().info(f"⚡ Activating inactive controllers: {to_activate}")
+
+        # --- Handle Servo Node Start ---
         if self.active_arm == 'xarm':
-            print("\n" + "="*40)
-            print("🚀 ACTIVE ARM: XARM (Tool Arm / Slider)")
-            print("="*40)
-            sw_req.activate_controllers = ['xarm_controller', 'slider_controller']
-            sw_req.deactivate_controllers = ['uf_controller']
+            print("\n🚀 [Control] Mode: XARM Servo (link5 focus)")
             self.srv_clients['xarm_start'].call_async(Trigger.Request())
         else:
-            print("\n" + "="*40)
-            print("🚀 ACTIVE ARM: UF850 (Manipulator Arm)")
-            print("="*40)
-            sw_req.activate_controllers = ['uf_controller']
-            sw_req.deactivate_controllers = ['xarm_controller', 'slider_controller']
+            print("\n🚀 [Control] Mode: UF850 Servo (tool0 focus)")
             self.srv_clients['uf_start'].call_async(Trigger.Request())
-
-        self.cm_client.call_async(sw_req)
 
     def joy_callback(self, msg):
         try:
             btns = list(msg.buttons) + [0] * (12 - len(msg.buttons))
             axes = list(msg.axes) + [0.0] * (8 - len(msg.axes))
 
-            # --- 🏠 BTN 3 (Y): HOMING ---
+            # --- 🏠 BTN 3 (Y): GLOBAL HOMING ---
             if btns[3] == 1 and self.last_buttons[3] == 0:
-                print("🏠 [Command] Homing both arms to disassembly pose...")
-                self.send_traj_goal(self.xarm_traj_pub, ['xarm5_joint1', 'xarm5_joint2', 'xarm5_joint3', 'xarm5_joint4', 'xarm5_joint5'], [0.0, 0.0, -1.57, 1.57, 0.0])
-                self.send_traj_goal(self.uf_traj_pub, ['u1_joint1', 'u1_joint2', 'u1_joint3', 'u1_joint4', 'u1_joint5', 'u1_joint6'], [0.0, 0.0, -1.57, 0.0, -1.57, 0.0])
+                print("🏠 [Command] GLOBAL HOME: Forcing all controllers active...")
+                
+                # 1. Force a controller sync before moving
+                self.manage_servo_nodes()
+                
+                # 2. Small sleep to let the controllers settle
+                time.sleep(0.2)
+
+                # 3. Now send the joint trajectories
+                # XARM Home Pose
+                self.send_traj_goal(self.xarm_traj_pub, 
+                    ['xarm5_joint1', 'xarm5_joint2', 'xarm5_joint3', 'xarm5_joint4', 'xarm5_joint5'], 
+                    [0.0, 0.0, -1.57, 1.57, 0.0])
+            
+                # UF850 Home Pose
+                self.send_traj_goal(self.uf_traj_pub, 
+                    ['u1_joint1', 'u1_joint2', 'u1_joint3', 'u1_joint4', 'u1_joint5', 'u1_joint6'], 
+                    [0.0, 0.0, -1.57, 0.0, -1.57, 0.0])
 
             # --- 📦 BTN 1 (B): GRAB / RELEASE (2/3) ---
             if btns[1] == 1 and self.last_buttons[1] == 0:
