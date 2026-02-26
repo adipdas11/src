@@ -29,6 +29,10 @@ from scipy.optimize import linear_sum_assignment
 DASHBOARD_HEIGHT = 550  
 PROCESSING_RATE_HZ = 15.0 
 
+# --- LOCAL VIEW ALIGNMENT SETTINGS ---
+LOCAL_CROSSHAIR_OFFSET_X = 13  # pixels
+LOCAL_CROSSHAIR_OFFSET_Y = 5   # pixels
+
 # --- IMPORT AGENTS ---
 from vision_agent.agents.scout import ScoutAgent
 from vision_agent.agents.sniper import SniperAgent
@@ -40,7 +44,6 @@ PATH_SNIPER = "/home/adip/workspaces/disassembly_ws/src/vision_training/train_vi
 PATH_REFEREE = "/home/adip/workspaces/disassembly_ws/src/vision_training/train_vision_model/project 3 (classification)/runs/classify/hdd_referee_model/weights/best.pt"
 
 # --- ARUCO ZONE CONFIGURATION ---
-# Defines the polygon boundary offsets (in mm) for the workspace and disposal bins based on ArUco marker centers.
 SHAPE_CONFIG = {
     0: {"TL": (-10, -175), "TR": (-355, -175), "BR": (-380, 15), "BL": (15, 15)},
     1: {"TL": (-115, -15), "TR": (15, -15), "BR": (24, 55), "BL": (-112, 55)},
@@ -82,16 +85,15 @@ class AngleStabilizer:
 
 class CentroidTracker:
     """Assigns and maintains consistent IDs for detected objects across frames."""
-    # CHANGED: maxDisappeared is now 300 to handle ~20 seconds of occlusion
     def __init__(self, maxDisappeared=300, maxDistance=100):
         self.nextObjectID = 0
         self.objects = OrderedDict()
-        self.objectLabels = OrderedDict() # CHANGED: Added dictionary to store class labels
+        self.objectLabels = OrderedDict() 
         self.disappeared = OrderedDict()
         self.maxDisappeared = maxDisappeared
         self.maxDistance = maxDistance
         
-    def register(self, centroid, label): # CHANGED: Now accepts label
+    def register(self, centroid, label): 
         self.objects[self.nextObjectID] = centroid
         self.objectLabels[self.nextObjectID] = label
         self.disappeared[self.nextObjectID] = 0
@@ -99,10 +101,10 @@ class CentroidTracker:
         
     def deregister(self, objectID):
         del self.objects[objectID]
-        del self.objectLabels[objectID] # CHANGED: Deregister label
+        del self.objectLabels[objectID] 
         del self.disappeared[objectID]
         
-    def update(self, rects, labels): # CHANGED: Now expects a list of labels too
+    def update(self, rects, labels): 
         if len(rects) == 0:
             for objectID in list(self.disappeared.keys()):
                 self.disappeared[objectID] += 1
@@ -121,7 +123,6 @@ class CentroidTracker:
             objectCentroids = list(self.objects.values())
             D = dist.cdist(np.array(objectCentroids), inputCentroids)
             
-            # CHANGED: Penalize mismatching labels so IDs don't jump between different parts
             for row, obj_id in enumerate(objectIDs):
                 for col, label in enumerate(labels):
                     if self.objectLabels[obj_id] != label:
@@ -155,7 +156,7 @@ class CentroidTracker:
 class AgentNode(Node):
     def __init__(self):
         super().__init__('vision_agent_node')
-        self.get_logger().info("--- Vision System (FT300 + Pose Keys + 3D Meters + Workspace) ---")
+        self.get_logger().info("--- Vision System (FT300 Zeroing + Pose Keys + 3D Meters + Workspace) ---")
 
         # --- LOAD AI MODELS ---
         try:
@@ -167,7 +168,6 @@ class AgentNode(Node):
             return
 
         # --- TRACKING & HELPERS ---
-        # CHANGED: maxDisappeared updated to 300 to match the class default
         self.tracker = CentroidTracker(maxDisappeared=300, maxDistance=100)
         self.angle_stabilizer = AngleStabilizer(window_size=15)
         self.bridge = CvBridge()
@@ -186,9 +186,12 @@ class AgentNode(Node):
         self.frame_global = None
         self.frame_depth_meters = None 
         self.frame_local = None
-        self.latest_wrench = None
         self.intrinsics = None 
         self.robot_states = {"tool_arm": "OFFLINE", "manip_arm": "OFFLINE"}
+        
+        # Wrench / Force Tracking
+        self.wrench_offset = None          # Stores initial baseline (tare)
+        self.latest_zeroed_wrench = None   # Stores actual value minus offset
 
         # --- SUBSCRIBERS ---
         self.sub_global = self.create_subscription(CompressedImage, '/camera/camera/color/image_raw/compressed', self.cb_global, 10)
@@ -243,7 +246,31 @@ class AgentNode(Node):
         except: pass
         
     def cb_wrench(self, msg):
-        self.latest_wrench = msg
+        # Initialize zeroing offset on first message
+        if self.wrench_offset is None:
+            self.wrench_offset = {
+                'fx': msg.wrench.force.x,
+                'fy': msg.wrench.force.y,
+                'fz': msg.wrench.force.z,
+                'tx': msg.wrench.torque.x,
+                'ty': msg.wrench.torque.y,
+                'tz': msg.wrench.torque.z
+            }
+            self.get_logger().info("✅ Force/Torque Sensor zeroed (Tared)!")
+        
+        # Calculate zeroed values by subtracting offset
+        self.latest_zeroed_wrench = {
+            "force": {
+                "x": msg.wrench.force.x - self.wrench_offset['fx'],
+                "y": msg.wrench.force.y - self.wrench_offset['fy'],
+                "z": msg.wrench.force.z - self.wrench_offset['fz']
+            },
+            "torque": {
+                "x": msg.wrench.torque.x - self.wrench_offset['tx'],
+                "y": msg.wrench.torque.y - self.wrench_offset['ty'],
+                "z": msg.wrench.torque.z - self.wrench_offset['tz']
+            }
+        }
 
     # -------------------------------------------------------------------------
     # Processing & Visuals
@@ -338,21 +365,26 @@ class AgentNode(Node):
         # 2c. Force & Torque
         y = 290
         if wrench_data:
-            f = wrench_data.wrench.force
-            t = wrench_data.wrench.torque
+            # wrench_data is now our zeroed dictionary
+            fx = wrench_data['force']['x']
+            fy = wrench_data['force']['y']
+            fz = wrench_data['force']['z']
+            tx = wrench_data['torque']['x']
+            ty = wrench_data['torque']['y']
+            tz = wrench_data['torque']['z']
             
-            draw_text(panel, "SENSORS (Force & Torque)", col2_x, y, 0.75, (200, 200, 200), 2)
+            draw_text(panel, "SENSORS (Zeroed)", col2_x, y, 0.75, (200, 200, 200), 2)
             y += 35
             def f_col(v): return (0, 0, 255) if abs(v) > 50.0 else (0, 255, 0)
             
-            draw_text(panel, f"Force X:  {f.x:>7.2f} N", col2_x + 10, y, 0.85, f_col(f.x), 2)
-            draw_text(panel, f"Force Y:  {f.y:>7.2f} N", col2_x + 10, y + 35, 0.85, f_col(f.y), 2)
-            draw_text(panel, f"Force Z:  {f.z:>7.2f} N", col2_x + 10, y + 70, 0.85, f_col(f.z), 2)
+            draw_text(panel, f"Force X:  {fx:>7.2f} N", col2_x + 10, y, 0.85, f_col(fx), 2)
+            draw_text(panel, f"Force Y:  {fy:>7.2f} N", col2_x + 10, y + 35, 0.85, f_col(fy), 2)
+            draw_text(panel, f"Force Z:  {fz:>7.2f} N", col2_x + 10, y + 70, 0.85, f_col(fz), 2)
 
             y += 110
-            draw_text(panel, f"Torque X: {t.x:>7.3f} Nm", col2_x + 10, y, 0.85, (180, 180, 180), 2)
-            draw_text(panel, f"Torque Y: {t.y:>7.3f} Nm", col2_x + 10, y + 35, 0.85, (180, 180, 180), 2)
-            draw_text(panel, f"Torque Z: {t.z:>7.3f} Nm", col2_x + 10, y + 70, 0.85, (180, 180, 180), 2)
+            draw_text(panel, f"Torque X: {tx:>7.3f} Nm", col2_x + 10, y, 0.85, (180, 180, 180), 2)
+            draw_text(panel, f"Torque Y: {ty:>7.3f} Nm", col2_x + 10, y + 35, 0.85, (180, 180, 180), 2)
+            draw_text(panel, f"Torque Z: {tz:>7.3f} Nm", col2_x + 10, y + 70, 0.85, (180, 180, 180), 2)
         else:
             draw_text(panel, "FT SENSOR OFF", col2_x, y, 0.85, (0, 0, 255), 2)
 
@@ -439,11 +471,11 @@ class AgentNode(Node):
             
             valid_objects = []
             rects = []
-            labels = [] # CHANGED: Create list to hold labels for tracker
+            labels = [] 
             
             for obj in raw_objects:
                 box = obj.get('box') or obj.get('bbox') or obj.get('xyxy')
-                label = obj.get('label') # CHANGED: Get the object's class label
+                label = obj.get('label') 
                 if not box: continue
                 
                 cx = int((box[0] + box[2]) / 2)
@@ -455,11 +487,10 @@ class AgentNode(Node):
                 if is_valid:
                     valid_objects.append(obj)
                     rects.append(box) 
-                    labels.append(label) # CHANGED: Append label to list
+                    labels.append(label) 
                 else:
                     cv2.rectangle(vis_global, (int(box[0]), int(box[1])), (int(box[2]), int(box[3])), (0, 0, 255), 1)
 
-            # CHANGED: Pass both rects and labels to the Class-Aware Tracker
             tracked_objects = self.tracker.update(rects, labels)
             
             for obj in valid_objects:
@@ -519,46 +550,75 @@ class AgentNode(Node):
             vis_global = np.zeros((480, 640, 3), dtype=np.uint8)
 
         # --- 2. LOCAL VIEW (SNIPER + REFEREE) ---
-        sniper_data = {"screw_heads": [], "tool_tips": [], "holes": []}
+        sniper_data = {"screw_heads": [], "tool_tips": [], "holes": [], "crosshair": []}
         status = {"state": "unknown", "confidence": 0.0}
         vis_local = None
 
         if self.frame_local is not None:
             vis_local = self.frame_local.copy()
-            sniper_data = self.sniper.target(self.frame_local)
+            h_loc, w_loc = vis_local.shape[:2]
+
+            raw_sniper_data = self.sniper.target(self.frame_local)
+            sniper_data.update(raw_sniper_data) # Keep existing keys, append crosshair later
             status = self.referee.inspect(self.frame_local)
             
+            # --- Draw Screws ---
             for s in sniper_data['screw_heads']:
+                if "box" in s:
+                    box = s["box"]
+                    cv2.rectangle(vis_local, (box[0], box[1]), (box[2], box[3]), (255, 255, 0), 2)
+                    cv2.putText(vis_local, "Screw", (box[0], box[1]-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
                 if "center" in s:
                     cx, cy = s["center"]
                     cv2.circle(vis_local, (cx, cy), 5, (255, 255, 0), -1) 
-                    cv2.putText(vis_local, "Screw", (cx+10, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+            
+            # --- Draw Tool Tip ---
             for t in sniper_data['tool_tips']:
                 if "contact_point" in t:
                     cx, cy = t["contact_point"]
                     cv2.circle(vis_local, (cx, cy), 5, (255, 0, 255), -1)
                     cv2.putText(vis_local, "Tool", (cx+10, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 1)
+            
+            # --- Draw Holes ---
             for h in sniper_data['holes']:
-                box = h["box"]
-                cv2.rectangle(vis_local, (box[0], box[1]), (box[2], box[3]), (0, 0, 255), 2)
+                if "box" in h:
+                    box = h["box"]
+                    cv2.rectangle(vis_local, (box[0], box[1]), (box[2], box[3]), (0, 0, 255), 2)
+                    cv2.putText(vis_local, "Hole", (box[0], box[1]-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+
+            # --- CALCULATE & PUBLISH CROSSHAIR ---
+            cross_x = (w_loc // 2) + LOCAL_CROSSHAIR_OFFSET_X
+            cross_y = (h_loc // 2) + LOCAL_CROSSHAIR_OFFSET_Y
+            sniper_data["crosshair"] = [int(cross_x), int(cross_y)] # Added to JSON data
+            
+            cv2.line(vis_local, (cross_x - 20, cross_y), (cross_x + 20, cross_y), (0, 255, 0), 2)
+            cv2.line(vis_local, (cross_x, cross_y - 20), (cross_x, cross_y + 20), (0, 255, 0), 2)
+            cv2.circle(vis_local, (cross_x, cross_y), 2, (0, 0, 255), -1)
+
+            # --- DRAW CAMERA FRAME AXES (TOP RIGHT) ---
+            ax_org_x, ax_org_y = w_loc - 60, 40
+            
+            # X Axis (Red, pointing right)
+            cv2.arrowedLine(vis_local, (ax_org_x, ax_org_y), (ax_org_x + 30, ax_org_y), (0, 0, 255), 2, tipLength=0.3)
+            cv2.putText(vis_local, "X", (ax_org_x + 35, ax_org_y + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+            
+            # Y Axis (Green, pointing down)
+            cv2.arrowedLine(vis_local, (ax_org_x, ax_org_y), (ax_org_x, ax_org_y + 30), (0, 255, 0), 2, tipLength=0.3)
+            cv2.putText(vis_local, "Y", (ax_org_x - 5, ax_org_y + 45), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
         else:
             vis_local = np.zeros((480, 640, 3), dtype=np.uint8)
 
         # --- 3. BUILD JSON PACKET ---
-        wrench_dict = {}
-        if self.latest_wrench:
-            w = self.latest_wrench.wrench
-            wrench_dict = {
-                "force": {"x": w.force.x, "y": w.force.y, "z": w.force.z},
-                "torque": {"x": w.torque.x, "y": w.torque.y, "z": w.torque.z}
-            }
+        # Fetching our zeroed dictionary if it exists, otherwise empty
+        wrench_dict = self.latest_zeroed_wrench if self.latest_zeroed_wrench else {}
 
         packet = {
             "timestamp": timestamp,
             "global_view": {"objects": objects},
-            "local_view": sniper_data,
+            "local_view": sniper_data, # Now includes 'crosshair'
             "assembly_state": status,
-            "force_torque": wrench_dict
+            "force_torque": wrench_dict # Now publishes the zeroed dict
         }
         self.json_pub.publish(String(data=json.dumps(packet)))
         
@@ -578,7 +638,8 @@ class AgentNode(Node):
             viz_l = resize_h(vis_local, h_target)
             top_row = np.hstack((viz_g, viz_l))
             
-            dashboard = self.draw_wide_dashboard(top_row.shape[1], objects, bin_locations, status, self.latest_wrench)
+            # Passing the zeroed wrench data into the dashboard
+            dashboard = self.draw_wide_dashboard(top_row.shape[1], objects, bin_locations, status, self.latest_zeroed_wrench)
             final_frame = np.vstack((top_row, dashboard))
             
             cv2.putText(final_frame, "GLOBAL (RGB+D)", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
