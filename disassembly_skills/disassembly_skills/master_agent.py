@@ -12,6 +12,7 @@ import time
 import json
 import threading
 import multiprocessing as mp
+import math
 from typing import List, Tuple, Optional, Dict, Any
 
 # ROS 2 Imports
@@ -23,7 +24,6 @@ from langgraph.graph import StateGraph, END
 
 from disassembly_skills.unscrew_skill import UnscrewSkill
 from disassembly_skills.object_hold_skill import ObjectHoldSkill
-# 🆕 NEW SKILLS ADDED HERE
 from disassembly_skills.object_flip_skill import ObjectFlipSkill
 from disassembly_skills.object_flip_drop_skill import FlipDropSkill
 
@@ -220,6 +220,10 @@ class MasterAgentNode(Node):
         self.has_printed_startup_vision = False
         self.auto_start_triggered = False
 
+        # --- NEW: SPATIAL MEMORY COMPLETION LOG ---
+        self.cleared_zones = []       # Stores XYZ tuples of removed parts
+        self.EXCLUSION_RADIUS = 0.010 # 15mm spherical blind spot tolerance
+
         API_KEY_FILE = "/home/adip/workspaces/disassembly_ws/src/disassembly_skills/config/api_key.txt"
         try:
             with open(API_KEY_FILE, "r") as f: OPENAI_API_KEY = f.read().strip()
@@ -230,7 +234,6 @@ class MasterAgentNode(Node):
 
         self.unscrew_skill = UnscrewSkill()
         self.hold_skill = ObjectHoldSkill()
-        # 🆕 INSTANTIATE NEW SKILLS
         self.flip_skill = ObjectFlipSkill()
         self.flip_drop_skill = FlipDropSkill()
 
@@ -245,7 +248,6 @@ class MasterAgentNode(Node):
                 "Performs an unscrewing action. Requires the ID and label of the part to be unscrewed.",
                 args={"unscrew_id": "int: ID of the target screw", "unscrew_label": "str: label of the target screw"}
             ),
-            # 🆕 ADD NEW TOOLS TO LLM
             "flip_object": Tool(
                 self.flip_object,
                 "Flips the object to access the back side. Use this when you need to access screws or parts that are currently hidden."
@@ -279,7 +281,22 @@ class MasterAgentNode(Node):
 
     async def unscrew(self, unscrew_id=None, unscrew_label=None):
         if unscrew_id is None or unscrew_label is None: return "Action failed, missing required parameter"
+        
+        # --- NEW: Retrieve XYZ before action to log to Spatial Memory ---
+        target_xyz = None
+        with self.vision_lock:
+            for obj in self.detected_objects:
+                if obj.get('id') == unscrew_id:
+                    target_xyz = obj.get('xyz')
+                    break
+
         self.unscrew_skill.execute_unscrew_command(target_id=unscrew_id, target_label=unscrew_label, interactive=False)
+        
+        # --- NEW: Add coordinates to Exclusion Zones ---
+        if target_xyz:
+            self.cleared_zones.append(target_xyz)
+            print(f"🛑 [MEMORY] Added Exclusion Zone at {target_xyz} (Radius: {self.EXCLUSION_RADIUS*1000}mm)")
+            
         return "Tool called successfully"
 
     # 🆕 NEW ASYNC WRAPPERS FOR NEW SKILLS
@@ -294,8 +311,22 @@ class MasterAgentNode(Node):
     async def lift_and_drop(self, object_id=None, object_name=None):
         if object_id == None or object_name == None:
             return "Action failed, missing object_id or object_name parameter"
-        else:
-            pass
+            
+        # --- NEW: Retrieve XYZ before action to log to Spatial Memory ---
+        target_xyz = None
+        with self.vision_lock:
+            for obj in self.detected_objects:
+                if obj.get('id') == object_id:
+                    target_xyz = obj.get('xyz')
+                    break
+                    
+        pass # Execution logic
+        
+        # --- NEW: Add coordinates to Exclusion Zones ---
+        if target_xyz:
+            self.cleared_zones.append(target_xyz)
+            print(f"🛑 [MEMORY] Added Exclusion Zone at {target_xyz} to hide removed part.")
+            
         return "Tool called successfully"
 
     # -----------------------------------------------------------------------------
@@ -305,13 +336,42 @@ class MasterAgentNode(Node):
         try:
             data = json.loads(msg.data.strip("'"))
             raw_objects = data.get("global_view", {}).get("objects", [])
-            temp_list = [{"id": o.get("id"), "label": o.get("label"), "xyz": o.get("xyz")} for o in raw_objects]
             
+            # --- NEW: Spatial Memory Filtering ---
+            temp_list = []
+            for o in raw_objects:
+                obj_id = o.get("id")
+                obj_label = o.get("label")
+                obj_xyz = o.get("xyz")
+                
+                # If no XYZ data exists, pass it through safely
+                if not obj_xyz or len(obj_xyz) < 3:
+                    temp_list.append({"id": obj_id, "label": obj_label, "xyz": obj_xyz})
+                    continue
+                    
+                is_cleared = False
+                for cleared_xyz in self.cleared_zones:
+                    # Calculate 3D Euclidean distance
+                    dist = math.hypot(
+                        obj_xyz[0] - cleared_xyz[0],
+                        obj_xyz[1] - cleared_xyz[1],
+                        obj_xyz[2] - cleared_xyz[2]
+                    )
+                    # If it falls inside the blind spot, flag it for deletion
+                    if dist < self.EXCLUSION_RADIUS:
+                        is_cleared = True
+                        break
+                        
+                # Only add objects to the LLM's view if they are not inside a cleared zone
+                if not is_cleared:
+                    temp_list.append({"id": obj_id, "label": obj_label, "xyz": obj_xyz})
+            # -------------------------------------
+
             with self.vision_lock:
                 self.detected_objects = temp_list
                 
                 if not self.has_printed_startup_vision and len(self.detected_objects) > 0:
-                    vis_text = f"Startup Snapshot ({len(self.detected_objects)} detected)."
+                    vis_text = f"Startup Snapshot ({len(self.detected_objects)} valid objects detected)."
                     print(f"\n{TColor.VISION}Vision: {vis_text}{TColor.RESET}")
                     
                     self.gui_queue.put({"node": "VISION", "text": vis_text})
@@ -531,7 +591,6 @@ def main(args=None):
     executor.add_node(node)
     executor.add_node(node.unscrew_skill)
     executor.add_node(node.hold_skill)
-    # 🆕 ADD NEW SKILLS TO EXECUTOR
     executor.add_node(node.flip_skill)
     executor.add_node(node.flip_drop_skill)
     

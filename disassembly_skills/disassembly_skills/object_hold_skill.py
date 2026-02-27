@@ -4,6 +4,7 @@ from rclpy.node import Node
 from rclpy.executors import MultiThreadedExecutor
 from std_msgs.msg import String, Bool
 from geometry_msgs.msg import Pose
+from std_srvs.srv import Trigger  
 import threading, json, math, time
 from disassembly_skills.motion_backend import MotionBackend
 
@@ -20,10 +21,11 @@ class ObjectHoldSkill(Node):
         self.create_subscription(String, '/vision/agent_state', self.vision_callback, 10)
         
         # --- Updated Topics for your Central State Managers ---
-        # This triggers the ObjectHoldStateManager
         self.hold_status_pub = self.create_publisher(Bool, '/object_hold_status', 10)
-        # This triggers the DisassemblyStateManager
         self.state_update_pub = self.create_publisher(String, '/robot_state/manip_arm/update', 10)
+        
+        # --- ⏰ Servo Start Service Client ---
+        self.uf_servo_start_client = self.create_client(Trigger, '/uf_servo_node/start_servo')
         
         # Configuration
         self.CAMERA_FRAME = 'camera_color_optical_frame'
@@ -44,7 +46,6 @@ class ObjectHoldSkill(Node):
         self.state_update_pub.publish(String(data=s))
 
     def publish_hold_status(self, h): 
-        # This is the 'Trigger' for your ObjectHoldStateManager
         self.hold_status_pub.publish(Bool(data=h))
 
     def vision_callback(self, msg):
@@ -52,6 +53,51 @@ class ObjectHoldSkill(Node):
             self.latest_vision_data = json.loads(msg.data.strip("'"))
             self.vision_event.set()
         except: pass
+
+    # --- 🛑 FIXED DYNAMIC SETTLE FUNCTION ---
+    def wait_for_arm_settled(self, timeout=20.0):
+        """
+        Dynamically monitors joint states. Proceeds only when all joints stop moving.
+        """
+        print("⏳ Waiting for arm to physically settle (monitoring joint states)...")
+        time.sleep(0.2) # Allow ROS 2 message buffer to catch up post-trajectory
+        
+        start_t = time.time()
+        settle_timer = 0.0
+        last_positions = {}
+        
+        # 0.006 rad is ~0.34 degrees. Ignores motor hum and minor vibrations.
+        NOISE_TOLERANCE = 0.006 
+
+        while rclpy.ok() and (time.time() - start_t) < timeout:
+            curr_positions = self.uf850.current_joint_positions.copy()
+            if not curr_positions:
+                time.sleep(0.1)
+                continue
+                
+            if last_positions:
+                # Find max delta across all tracked arm joints
+                max_delta = 0.0
+                for j_name, j_pos in curr_positions.items():
+                    if j_name in last_positions:
+                        delta = abs(j_pos - last_positions[j_name])
+                        if delta > max_delta:
+                            max_delta = delta
+                            
+                # If movement is within the noise tolerance
+                if max_delta <= NOISE_TOLERANCE:
+                    settle_timer += 0.1
+                    if settle_timer >= 0.4: # Needs to be still for 0.4 seconds
+                        print("✅ Arm has completely settled.")
+                        return True
+                else:
+                    settle_timer = 0.0 # Reset if a joint moves beyond tolerance
+                    
+            last_positions = curr_positions
+            time.sleep(0.1)
+            
+        print("⚠️ Warning: Arm settle timeout reached. Proceeding anyway.")
+        return True
 
     def wait_for_gripper(self, target_deg, timeout=5.0):
         """
@@ -116,11 +162,29 @@ class ObjectHoldSkill(Node):
         self.gripper.move_to_joint_positions({self.JOINT_GRIPPER: math.radians(self.OPEN_DEG)})
         if not self.uf850.move_to_pose_robust(tx, ty, hz, qd, velocity=0.1): return False
 
+        # 🛑 DYNAMIC FIX: Monitor joint states until physical swaying stops
+        self.wait_for_arm_settled()
+
+        # --- ⏰ Request Servo Node to Activate ---
+        print("⏰ Requesting UF850 Servo Node to Activate...")
+        if self.uf_servo_start_client.wait_for_service(timeout_sec=2.0):
+            self.uf_servo_start_client.call_async(Trigger.Request())
+        else:
+            self.get_logger().warn("⚠️ /uf_servo_node/start_servo service not available!")
+            
+        # We still need this 1.0s software delay. This gives the ROS 2 Controller Manager
+        # enough time to gracefully kill the Trajectory Node and boot the Servo Node.
+        time.sleep(1.0) 
+
         # --- STEP 2: 1st TACTILE DESCENT & RETRACT 0.01m ---
         if interactive: input("🚀 STEP 2: 1st TACTILE DESCENT (Retract 0.01m)? [Enter]")
         if not self.uf850.move_linear_z_with_torque_stop(0.1, self.TORQUE_THRESHOLD): return False
+        self.wait_for_arm_settled() # 🛑 ADDED POST-DESCENT SETTLE
+        
         time.sleep(0.5)
+        
         if not self.uf850.retract_relative_z(0.01): return False
+        self.wait_for_arm_settled() # 🛑 ADDED POST-RETRACT SETTLE
 
         # --- STEP 3: SLIDE ---
         if interactive: input("🚀 STEP 3: SLIDE into position? [Enter]")
@@ -132,11 +196,27 @@ class ObjectHoldSkill(Node):
         gy = wy - (self.TOOL_LENGTH * math.cos(tilt) * math.sin(v_rad))
         if not self.uf850.move_to_pose_robust(gx, gy, cz, qd, velocity=0.1): return False
 
+        # 🛑 DYNAMIC FIX: Monitor joint states after sliding
+        self.wait_for_arm_settled()
+
+        # --- ⏰ WAKE UP UF850 SERVO NODE AGAIN ---
+        print("⏰ Requesting UF850 Servo Node to Activate...")
+        if self.uf_servo_start_client.wait_for_service(timeout_sec=2.0):
+            self.uf_servo_start_client.call_async(Trigger.Request())
+        else:
+            self.get_logger().warn("⚠️ /uf_servo_node/start_servo service not available!")
+            
+        time.sleep(1.0)
+
         # --- STEP 4: 2nd TACTILE DESCENT & RETRACT 0.005m ---
         if interactive: input("🚀 STEP 4: 2nd TACTILE DESCENT (Retract 0.005m)? [Enter]")
         if not self.uf850.move_linear_z_with_torque_stop(0.08, self.TORQUE_THRESHOLD): return False
+        self.wait_for_arm_settled() # 🛑 ADDED POST-DESCENT SETTLE
+        
         time.sleep(0.5)
+        
         if not self.uf850.retract_relative_z(0.005): return False
+        self.wait_for_arm_settled() # 🛑 ADDED POST-RETRACT SETTLE
 
         # --- STEP 5: CLOSE ---
         if interactive: input("🚀 STEP 5: CLOSE Gripper? [Enter]")

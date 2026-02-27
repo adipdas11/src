@@ -30,7 +30,7 @@ DASHBOARD_HEIGHT = 550
 PROCESSING_RATE_HZ = 15.0 
 
 # --- LOCAL VIEW ALIGNMENT SETTINGS ---
-LOCAL_CROSSHAIR_OFFSET_X = 8  # pixels
+LOCAL_CROSSHAIR_OFFSET_X = 5  # pixels
 LOCAL_CROSSHAIR_OFFSET_Y = 5   # pixels
 
 # --- IMPORT AGENTS ---
@@ -99,13 +99,13 @@ class Point3DStabilizer:
 
 class StaticAnchorTracker:
     """Assigns IDs based on fixed spatial anchors. Includes Deadband locking to eliminate jitter."""
-    def __init__(self, tolerance=60, maxDisappeared=1000, deadband=5.0, alpha=0.2):
+    def __init__(self, tolerance=60, maxDisappeared=3000, deadband=5.0, alpha=0.2):
         self.nextObjectID = 0
         self.anchors = {} 
         self.tolerance = tolerance
         self.maxDisappeared = maxDisappeared
-        self.deadband = deadband # Pixels of movement to ignore entirely
-        self.alpha = alpha       # EMA smoothing factor for physical movements
+        self.deadband = deadband 
+        self.alpha = alpha       
 
     def update(self, rects, labels):
         assigned_ids = {} 
@@ -145,12 +145,9 @@ class StaticAnchorTracker:
                 used_anchors.add(best_id)
                 old_cx, old_cy = self.anchors[best_id]['centroid']
                 
-                # --- DEADBAND JITTER LOCK ---
                 if min_dist < self.deadband:
-                    # Movement is tiny (camera noise), heavily lock the coordinates
                     final_cx, final_cy = old_cx, old_cy
                 else:
-                    # Object actually shifted, smoothly transition
                     final_cx = int(self.alpha * cx + (1 - self.alpha) * old_cx)
                     final_cy = int(self.alpha * cy + (1 - self.alpha) * old_cy)
 
@@ -178,7 +175,7 @@ class StaticAnchorTracker:
 class AgentNode(Node):
     def __init__(self):
         super().__init__('vision_agent_node')
-        self.get_logger().info("--- Vision System (Static Tracker + XYZ Smoothing + Zeroing) ---")
+        self.get_logger().info("--- Vision System (Static Tracker 3000 + Reset Logic) ---")
 
         # --- LOAD AI MODELS ---
         try:
@@ -192,7 +189,7 @@ class AgentNode(Node):
         # --- TRACKING & HELPERS ---
         self.tracker = StaticAnchorTracker(tolerance=60, maxDisappeared=3000)
         self.angle_stabilizer = AngleStabilizer(window_size=15)
-        self.xyz_stabilizer = Point3DStabilizer(window_size=15) # New 3D Jitter Filter
+        self.xyz_stabilizer = Point3DStabilizer(window_size=15)
         self.bridge = CvBridge()
         
         # --- ARUCO SETUP ---
@@ -212,7 +209,6 @@ class AgentNode(Node):
         self.intrinsics = None 
         self.robot_states = {"tool_arm": "OFFLINE", "manip_arm": "OFFLINE"}
         
-        # Wrench / Force Tracking
         self.wrench_offset = None          
         self.latest_zeroed_wrench = None   
 
@@ -223,6 +219,9 @@ class AgentNode(Node):
         self.sub_local = self.create_subscription(CompressedImage, '/tool_cam/image_raw/compressed', self.cb_local, 10)
         self.sub_wrench = self.create_subscription(WrenchStamped, '/robotiq_force_torque_sensor_broadcaster/wrench', self.cb_wrench, 10)
         self.sub_states = self.create_subscription(String, '/robot_states', self.cb_robot_states, 10)
+        
+        # New Reset Topic Subscriber
+        self.sub_reset = self.create_subscription(String, '/vision/reset_tracker', self.cb_reset_request, 10)
         
         # --- PUBLISHERS ---
         self.json_pub = self.create_publisher(String, '/vision/agent_state', 10)
@@ -236,6 +235,18 @@ class AgentNode(Node):
     # -------------------------------------------------------------------------
     # ROS Callbacks
     # -------------------------------------------------------------------------
+    def cb_reset_request(self, msg):
+        """Clears all stored tracking IDs and smoothing history."""
+        self.get_logger().info("♻️ RESETTING TRACKER AND STABILIZERS...")
+        # Clear tracker anchors and reset ID count
+        self.tracker.anchors.clear()
+        self.tracker.nextObjectID = 0
+        # Clear smoothing history for all filters
+        self.angle_stabilizer.histories.clear()
+        self.xyz_stabilizer.histories.clear()
+        self.buffers.clear()
+        self.get_logger().info("✅ Reset Complete. Starting fresh IDs.")
+
     def cb_robot_states(self, msg):
         try:
             self.robot_states = json.loads(msg.data)
@@ -335,7 +346,6 @@ class AgentNode(Node):
         cv2.rectangle(panel, (0, 0), (width, 45), (40, 40, 40), -1)
         draw_text(panel, "SYSTEM DASHBOARD", 20, 35, 1.0, (0, 255, 255), 2)
 
-        # --- COL 1: GLOBAL PARTS ---
         col1_x = 20
         draw_text(panel, "DETECTED PARTS", col1_x, 80, 0.75, (200, 200, 200), 2)
         y = 120
@@ -356,11 +366,9 @@ class AgentNode(Node):
         else:
             draw_text(panel, "No parts detected", col1_x, y, 0.85, (100, 100, 100), 2)
 
-        # --- COL 2: TOOL STATUS, ROBOT STATES & FORCE ---
         col2_x = width // 2 - 120 
         draw_text(panel, "VISION AI STATE", col2_x, 80, 0.75, (200, 200, 200), 2)
         
-        # 2a. Referee Box
         state = status['state'].upper()
         box_color = (50, 50, 50)
         if state == "UNSCREWED": box_color = (0, 200, 0)
@@ -370,7 +378,6 @@ class AgentNode(Node):
         cv2.rectangle(panel, (col2_x, 100), (col2_x + 350, 150), box_color, -1)
         draw_text(panel, state, col2_x + 20, 135, 0.9, (255, 255, 255), 2)
         
-        # 2b. Dual-Arm Robot States
         y = 190
         draw_text(panel, "ROBOT ARM STATES", col2_x, y, 0.75, (200, 200, 200), 2)
         t_state = self.robot_states.get("tool_arm", "OFFLINE")
@@ -379,7 +386,6 @@ class AgentNode(Node):
         draw_text(panel, f"Tool  (xArm) : {t_state}", col2_x + 10, y + 30, 0.8, (0, 255, 255), 2)
         draw_text(panel, f"Manip (UF850): {m_state}", col2_x + 10, y + 60, 0.8, (0, 255, 255), 2)
         
-        # 2c. Force & Torque
         y = 290
         if wrench_data:
             fx = wrench_data['force']['x']
@@ -404,7 +410,6 @@ class AgentNode(Node):
         else:
             draw_text(panel, "FT SENSOR OFF", col2_x, y, 0.85, (0, 0, 255), 2)
 
-        # --- COL 3: LOCATIONS (BINS + WORKSPACE) ---
         col3_x = width - 350
         draw_text(panel, "LOCATIONS (Cam Frame)", col3_x, 80, 0.75, (200, 200, 200), 2)
         y = 120
@@ -442,7 +447,6 @@ class AgentNode(Node):
         bin_locations = {} 
         vis_global = None
         
-        # --- 1. GLOBAL VIEW (SCOUT + ARUCO + DEPTH) ---
         if self.frame_global is not None:
             vis_global = self.frame_global.copy()
             overlay = vis_global.copy()
@@ -494,11 +498,10 @@ class AgentNode(Node):
                 label = obj.get('label') 
                 if not box: continue
                 
-                # Raw Center
-                cx = int((box[0] + box[2]) / 2)
-                cy = int((box[1] + box[3]) / 2)
+                raw_cx = int((box[0] + box[2]) / 2)
+                raw_cy = int((box[1] + box[3]) / 2)
                 is_valid = False
-                if workspace_poly is not None and cv2.pointPolygonTest(workspace_poly, (cx, cy), False) >= 0:
+                if workspace_poly is not None and cv2.pointPolygonTest(workspace_poly, (raw_cx, raw_cy), False) >= 0:
                     is_valid = True
                 
                 if is_valid:
@@ -512,8 +515,6 @@ class AgentNode(Node):
             
             for obj in valid_objects:
                 box = obj.get('box') or obj.get('bbox') or obj.get('xyxy')
-                
-                # Use raw to find matched ID
                 raw_cx = int((box[0] + box[2]) / 2)
                 raw_cy = int((box[1] + box[3]) / 2)
                 
@@ -526,7 +527,6 @@ class AgentNode(Node):
                         obj_id = t_id
                 obj['id'] = obj_id 
                 
-                # --- APPLY THE SMOOTHED/LOCKED PIXEL CENTER ---
                 if obj_id != -1 and obj_id in tracked_objects:
                     cx, cy = tracked_objects[obj_id]
                 else:
@@ -550,7 +550,6 @@ class AgentNode(Node):
 
                 xyz_meters = self.get_3d_coordinates(cx, cy, pts) 
                 
-                # --- APPLY THE SMOOTHED 3D DEPTH ---
                 if xyz_meters and obj_id != -1:
                     xyz_meters = self.xyz_stabilizer.update(obj_id, xyz_meters)
 
@@ -579,7 +578,6 @@ class AgentNode(Node):
         else:
             vis_global = np.zeros((480, 640, 3), dtype=np.uint8)
 
-        # --- 2. LOCAL VIEW (SNIPER + REFEREE) ---
         sniper_data = {"screw_heads": [], "tool_tips": [], "holes": [], "crosshair": []}
         status = {"state": "unknown", "confidence": 0.0}
         vis_local = None
@@ -626,11 +624,9 @@ class AgentNode(Node):
             cv2.putText(vis_local, "X", (ax_org_x + 35, ax_org_y + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
             cv2.arrowedLine(vis_local, (ax_org_x, ax_org_y), (ax_org_x, ax_org_y + 30), (0, 255, 0), 2, tipLength=0.3)
             cv2.putText(vis_local, "Y", (ax_org_x - 5, ax_org_y + 45), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-
         else:
             vis_local = np.zeros((480, 640, 3), dtype=np.uint8)
 
-        # --- 3. BUILD JSON PACKET ---
         wrench_dict = self.latest_zeroed_wrench if self.latest_zeroed_wrench else {}
 
         packet = {
@@ -645,7 +641,6 @@ class AgentNode(Node):
         if bin_locations: 
             self.bin_pub.publish(String(data=json.dumps(bin_locations)))
 
-        # --- 4. VISUALIZATION EXPORT ---
         try:
             h_target = 480 
             def resize_h(img, target_h):

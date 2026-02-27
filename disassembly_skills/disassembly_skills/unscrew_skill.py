@@ -57,6 +57,47 @@ class UnscrewSkill(Node):
                     self.cached_bin1_xyz = data["bin_1"]["xyz"]
         except: pass
 
+    # --- 🛑 NEW DYNAMIC SETTLE FUNCTION ---
+    def wait_for_arm_settled(self, timeout=20.0):
+        """
+        Dynamically monitors joint states. Proceeds only when all joints stop moving.
+        """
+        print("⏳ Waiting for arm to physically settle (monitoring joint states)...")
+        time.sleep(0.2) # Allow ROS 2 message buffer to catch up post-trajectory
+        
+        start_t = time.time()
+        settle_timer = 0.0
+        last_positions = {}
+        NOISE_TOLERANCE = 0.006 
+
+        while rclpy.ok() and (time.time() - start_t) < timeout:
+            curr_positions = self.moveit_backend.current_joint_positions.copy()
+            if not curr_positions:
+                time.sleep(0.1)
+                continue
+                
+            if last_positions:
+                max_delta = 0.0
+                for j_name, j_pos in curr_positions.items():
+                    if j_name in last_positions:
+                        delta = abs(j_pos - last_positions[j_name])
+                        if delta > max_delta:
+                            max_delta = delta
+                            
+                if max_delta <= NOISE_TOLERANCE:
+                    settle_timer += 0.1
+                    if settle_timer >= 0.4: 
+                        print("✅ Arm has completely settled.")
+                        return True
+                else:
+                    settle_timer = 0.0 
+                    
+            last_positions = curr_positions
+            time.sleep(0.1)
+            
+        print("⚠️ Warning: Arm settle timeout reached. Proceeding anyway.")
+        return True
+
     # =========================================================================
     # 1. STAIRCASE: CROSSHAIR SEQUENTIAL ALIGN + FORCE DESCENT + WIGGLE CHECK
     # =========================================================================
@@ -65,7 +106,7 @@ class UnscrewSkill(Node):
         
         # --- ⚙️ SPEED & VELOCITY CONTROLS ---
         XY_SPEED_GAIN = 10.0      
-        Z_DESCENT_SPEED = 0.01   
+        Z_DESCENT_SPEED = 0.009   
         MAX_XY_STEP = 0.025       
         
         # --- 🌀 AGGRESSIVE FAST SPIRAL SEARCH CONTROLS ---
@@ -327,27 +368,39 @@ class UnscrewSkill(Node):
         self.tool_pub.publish(cmd_msg)
         time.sleep(0.5) 
             
-        # --- NEW: CONTINUOUS SLOW SERVO RETRACT (10 SECONDS) ---
+        # --- NEW: CONTINUOUS SLOW SERVO RETRACT WITH WIGGLE (15 SECONDS) ---
         Z_SLOW_RETRACT_SPEED = 0.01  # Matches Z_DESCENT_SPEED for consistent slow motion
-        SLOW_RETRACT_DURATION = 10.0 # Run for exactly 10 seconds
+        SLOW_RETRACT_DURATION = 15.0 # Run for exactly 15 seconds
         
-        print(f"🐢 [SLOW RETRACT] Gently pulling screw out at {Z_SLOW_RETRACT_SPEED*1000}mm/s for {SLOW_RETRACT_DURATION}s...")
+        # Wiggle parameters: Swirls 3mm/s in a circle at 1.5 Hz
+        WIGGLE_XY_SPEED = 0.003      
+        WIGGLE_FREQ = 1.5            
+        
+        print(f"🐢 [SLOW RETRACT + WIGGLE] Gently pulling and swirling screw out at {Z_SLOW_RETRACT_SPEED*1000}mm/s for {SLOW_RETRACT_DURATION}s...")
         
         retract_start = time.time()
         while rclpy.ok() and (time.time() - retract_start) < SLOW_RETRACT_DURATION:
-            self.moveit_backend.jog_cartesian_servo(0.0, 0.0, Z_SLOW_RETRACT_SPEED, duration=0.1)
+            elapsed = time.time() - retract_start
+            
+            # Calculate smooth circular wiggle velocities using sine and cosine waves
+            wx = WIGGLE_XY_SPEED * math.cos(2 * math.pi * WIGGLE_FREQ * elapsed)
+            wy = WIGGLE_XY_SPEED * math.sin(2 * math.pi * WIGGLE_FREQ * elapsed)
+            
+            # Inject wx and wy alongside the continuous Z retract
+            self.moveit_backend.jog_cartesian_servo(wx, wy, Z_SLOW_RETRACT_SPEED, duration=0.1)
             time.sleep(0.1)
         
         print("⬆️ [FAST RETRACT] Lifting 50mm to clear the workspace...")
         self.moveit_backend.retract_relative_z(0.050) 
+        self.wait_for_arm_settled() # 🛑 ADDED POST-RETRACT SETTLE
         
         return True
 
     # =========================================================================
     # EXECUTION SEQUENCE (WITH DROP-OFF)
     # =========================================================================
-    def execute_unscrew_sequence(self, target_id):
-        print(f"\n🛠️ [START] Sequence on ID: {target_id}")
+    def execute_unscrew_command(self, target_id, target_label=None, interactive=True):
+        print(f"\n🛠️ [START] Sequence on ID: {target_id} (Label: {target_label})")
         time.sleep(0.1)
         
         with self.data_lock:
@@ -380,17 +433,20 @@ class UnscrewSkill(Node):
             print(f"❌ ABORT: Reach {dist_base:.3f}m exceeds limit.")
             return False
 
-        input("👉 GATE 1: Press [ENTER] to Approach Hover...")
+        if interactive: input("👉 GATE 1: Press [ENTER] to Approach Hover...")
         self.moveit_backend.retract_relative_z(self.TRANSIT_LIFT)
         
         if self.moveit_backend.move_to_pose_robust(tx_world, ty_world, tz_flange_hover):
             print("✅ [STATUS] Hover Complete.")
             
-            input("👉 GATE 2: Press [ENTER] to start Force-Controlled Staircase Descent...")
+            # 🛑 NEW FIX: Wait for xArm to settle ONLY after arriving at the hover pose
+            self.wait_for_arm_settled()
+            
+            if interactive: input("👉 GATE 2: Press [ENTER] to start Force-Controlled Staircase Descent...")
             if self.perform_staircase_descent():
                 print("🏁 [FINISH] Bit is seated. Ready for unscrewing.")
                 
-                input("👉 GATE 3: Press [ENTER] to execute Dynamic Force-Compliant Extraction...")
+                if interactive: input("👉 GATE 3: Press [ENTER] to execute Dynamic Force-Compliant Extraction...")
                 if self.perform_compliant_extraction():
                     print("🎉 [SUCCESS] Screw successfully removed!")
                     
@@ -406,7 +462,7 @@ class UnscrewSkill(Node):
                         
                         if self.moveit_backend.move_to_pose_robust(bx, by, bz):
                             print("⏬ [WAITING] Allowing arm to settle over bin...")
-                            time.sleep(2.0)
+                            self.wait_for_arm_settled() # 🛑 REPLACED TIME.SLEEP(2.0)
                             
                             print("⏬ [RELEASE] Dropping screw...")
                             drop_cmd = Int8()
@@ -418,7 +474,7 @@ class UnscrewSkill(Node):
                             self.tool_pub.publish(drop_cmd)
                             print("♻️ [RESET] Ready for next target.")
                     
-                input("👉 Sequence Finished. Press [ENTER] to return to monitoring...")
+                if interactive: input("👉 Sequence Finished. Press [ENTER] to return to monitoring...")
                 return True
         return False
 
@@ -436,7 +492,8 @@ def main(args=None):
             with node.data_lock:
                 if node.latest_targets: target_id = node.latest_targets[0]['id']
             if target_id is not None:
-                node.execute_unscrew_sequence(target_id)
+                # In standalone mode, we can test it interactively
+                node.execute_unscrew_command(target_id, target_label="screw", interactive=True)
                 with node.data_lock: node.latest_targets = []
             time.sleep(0.5)
     except KeyboardInterrupt: pass
