@@ -36,7 +36,7 @@ class UnscrewSkill(Node):
         self.local_view = {}
         self.cached_bin1_xyz = None  
         
-        self.get_logger().info("🚀 Full Unscrew Skill: Align, Wiggle, Extraction & Drop-Off Active.")
+        self.get_logger().info("🚀 Full Unscrew Skill: Align, Wiggle, Dynamic Velocity Extraction & Drop-Off Active.")
 
     def vision_callback(self, msg):
         try:
@@ -64,9 +64,9 @@ class UnscrewSkill(Node):
         print("\n🔍 [STAIRCASE] Starting Sequential Crosshair Alignment & Descent...")
         
         # --- ⚙️ SPEED & VELOCITY CONTROLS ---
-        XY_SPEED_GAIN = 7.0        
+        XY_SPEED_GAIN = 10.0      
         Z_DESCENT_SPEED = 0.01   
-        MAX_XY_STEP = 0.015        
+        MAX_XY_STEP = 0.025       
         
         # --- 🌀 AGGRESSIVE FAST SPIRAL SEARCH CONTROLS ---
         SPIRAL_GAP_MM = 15.0         
@@ -83,7 +83,7 @@ class UnscrewSkill(Node):
         
         # --- 🛑 STRICT FAIL CONDITIONS ---
         FORCE_SPIKE_THRESHOLD = 3.0  
-        ALIGN_TOLERANCE_PX = 15.0    
+        ALIGN_TOLERANCE_PX = 10.0    
         RETRACT_DIST = 0.005         
         
         # --- 🔄 WIGGLE TEST CONTROLS ---
@@ -99,6 +99,9 @@ class UnscrewSkill(Node):
         print(f"⚖️ Baselines -> Fx: {base_fx:.2f}N | Fy: {base_fy:.2f}N | Fz: {base_fz:.2f}N")
         
         spiral_idx = 0
+        retry_count = 0
+        MAX_RETRIES = 3
+        
         while rclpy.ok():
             with self.data_lock:
                 local = copy.deepcopy(self.local_view)
@@ -125,10 +128,15 @@ class UnscrewSkill(Node):
             if diff_fz > FORCE_SPIKE_THRESHOLD:
                 print(f"🎯 [CONTACT] Z-Force Spike Detected: {diff_fz:.2f}N.")
                 
+                # --- RETRY LOGIC FOR MISALIGNMENT ---
                 if dist_px > ALIGN_TOLERANCE_PX:
-                    print(f"❌ [MISALIGNED] Hit surface but error is {dist_px:.1f}px. Retracting 5mm.")
-                    self.moveit_backend.jog_cartesian_servo(0.0, 0.0, RETRACT_DIST, duration=0.5)
-                    return False
+                    retry_count += 1
+                    print(f"❌ [MISALIGNED] Error is {dist_px:.1f}px. Retry {retry_count}/{MAX_RETRIES}. Retracting 5mm...")
+                    self.moveit_backend.retract_relative_z(0.005) # Guaranteed 5mm lift
+                    time.sleep(1.0)
+                    if retry_count > MAX_RETRIES:
+                        return False
+                    continue
                 
                 print("🔩 [SEATING] Rotating screwdriver briefly to seat the bit...")
                 self.moveit_backend.jog_cartesian_servo(0.0, 0.0, 0.0, duration=0.5) 
@@ -180,10 +188,16 @@ class UnscrewSkill(Node):
                     self.moveit_backend.jog_cartesian_servo(-w_dx, -w_dy, 0.0, duration=0.5)
                     time.sleep(0.5)
 
+                # --- RETRY LOGIC FOR WIGGLE FAIL ---
                 if successful_wiggles < 3:
-                    print(f"❌ [WIGGLE FAIL] Only {successful_wiggles}/4 wiggles succeeded. Retracting 5mm.")
-                    self.moveit_backend.jog_cartesian_servo(0.0, 0.0, RETRACT_DIST, duration=0.5)
-                    return False
+                    retry_count += 1
+                    print(f"❌ [WIGGLE FAIL] Only {successful_wiggles}/4 wiggles succeeded. Retry {retry_count}/{MAX_RETRIES}. Retracting 5mm...")
+                    self.moveit_backend.retract_relative_z(0.005) # Guaranteed 5mm lift
+                    time.sleep(1.0) # Let forces completely settle before re-aligning
+                    if retry_count > MAX_RETRIES:
+                        print("❌ Max retries reached. Aborting target.")
+                        return False
+                    continue 
                 
                 print("✅ [WIGGLE PASS] Bit is fully seated and locked into screw head.")
                 return True
@@ -243,19 +257,20 @@ class UnscrewSkill(Node):
         return False
 
     # =========================================================================
-    # 2. EXTRACTION: FORCE-COMPLIANT UNSCREWING & SLOW RETRACT
+    # 2. EXTRACTION: DYNAMIC VELOCITY-SERVOING FORCE COMPLIANCE & SLOW RETRACT
     # =========================================================================
     def perform_compliant_extraction(self):
-        print("\n🔄 [EXTRACTION] Starting Force-Compliant Unscrewing & Grab...")
+        print("\n🔄 [EXTRACTION] Starting Dynamic Velocity-Servoing Force Compliance & Grab...")
         
-        K_P_COMPLIANCE = 0.001       
-        MAX_RETRACT_STEP = 0.005     
-        EXTRACTION_TIME = 4.0        
-        FORCE_DEADBAND = 0.5         
+        # --- ⚙️ COMPLIANCE TUNING CONTROLS (VELOCITY-BASED) ---
+        K_V_COMPLIANCE = 0.002       
+        MAX_Z_SPEED = 0.0005          
+        FORCE_DEADBAND = 0.3         
         
-        # --- 🐢 CONTINUOUS SLOW RETRACT CONTROLS ---
-        SLOW_RETRACT_TIME = 4.0      # Duration to continuously retract
-        Z_RETRACT_SPEED = 0.04      # Speed to move up (Matches descent speed)
+        # --- ⏱️ DYNAMIC EXTRACTION CONTROLS ---
+        STABLE_DURATION = 3.0          # Time to wait with no force increase to declare success
+        FORCE_FLUCTUATION_MARGIN = 1.0 # Allowable force bounce (N) before timer resets
+        MAX_EXTRACTION_TIME = 20.0     # Absolute max time (safety net)
         
         with self.data_lock:
             baseline_fz = self.local_view.get('force_torque', {}).get('force', {}).get('z', 0.0)
@@ -270,39 +285,60 @@ class UnscrewSkill(Node):
         cmd_msg.data = 2 # Grab with 2-finger onrobot rg6 gripper
         self.tool_pub.publish(cmd_msg)
         
-        # --- The Compliance Loop (First 4 Seconds) ---
+        # Variables to track when the force plateaus
+        peak_upward_force = 0.0
+        last_increase_time = time.time()
         start_time = time.time()
-        while rclpy.ok() and (time.time() - start_time) < EXTRACTION_TIME:
+        
+        # --- The Dynamic Velocity-Servoing Compliance Loop ---
+        while rclpy.ok() and (time.time() - start_time) < MAX_EXTRACTION_TIME:
             with self.data_lock:
                 current_fz = self.local_view.get('force_torque', {}).get('force', {}).get('z', 0.0)
                 
-            force_error = current_fz - baseline_fz 
-            z_step = force_error * K_P_COMPLIANCE
-            z_step = max(min(z_step, MAX_RETRACT_STEP), -MAX_RETRACT_STEP)
+            raw_force_error = current_fz - baseline_fz 
             
-            if abs(force_error) > FORCE_DEADBAND:
-                print(f"🔩 Unscrewing... Force diff: {force_error:+.2f}N | Retracting Z: {z_step*1000:+.2f}mm")
-                self.moveit_backend.jog_cartesian_servo(0.0, 0.0, z_step, duration=0.1)
+            # Since upward pressure results in a negative value in the sensor, flip it to positive
+            upward_force = -raw_force_error
+            
+            # --- DYNAMIC EXTRACTION CHECK ---
+            if upward_force > (peak_upward_force + FORCE_FLUCTUATION_MARGIN):
+                peak_upward_force = upward_force
+                last_increase_time = time.time() # Reset the 3-second timer
+                
+            if (time.time() - last_increase_time) >= STABLE_DURATION:
+                print(f"🎉 [FREE] Upward force stabilized for {STABLE_DURATION}s (Peak: {peak_upward_force:.2f}N).")
+                break # Break out of the compliance loop early!
+            
+            # Calculate the compliant speed (0.0 prevents downward movement)
+            z_speed = upward_force * K_V_COMPLIANCE
+            z_speed = max(min(z_speed, MAX_Z_SPEED), 0.0)
+            
+            if upward_force > FORCE_DEADBAND:
+                print(f"🔩 Yielding... Upward Force: {upward_force:+.2f}N | Z-Speed: {z_speed*1000:+.2f}mm/tick")
+                self.moveit_backend.jog_cartesian_servo(0.0, 0.0, z_speed, duration=0.1)
             else:
                 self.moveit_backend.jog_cartesian_servo(0.0, 0.0, 0.0, duration=0.1)
             
             time.sleep(0.1)
             
-        # --- NEW: Smooth Continuous Slow Retract (Next 4 Seconds) ---
-        print(f"🐢 [SLOW RETRACT] Gently pulling screw out smoothly over {SLOW_RETRACT_TIME}s...")
-        retract_start = time.time()
-        
-        while rclpy.ok() and (time.time() - retract_start) < SLOW_RETRACT_TIME:
-            # Continually command an upward Z movement while motor is still spinning
-            self.moveit_backend.jog_cartesian_servo(0.0, 0.0, Z_RETRACT_SPEED, duration=0.2)
-            time.sleep(0.25)
-            
-        print("✅ [EXTRACTION] Thread cleared. Stopping motor...")
+        # --- STOP UNSCREWING MOTOR ---
+        print("✅ [EXTRACTION] Thread cleared. Stopping unscrew motor before retracting...")
         cmd_msg.data = 0
         self.tool_pub.publish(cmd_msg)
-        time.sleep(0.5)
+        time.sleep(0.5) 
+            
+        # --- NEW: CONTINUOUS SLOW SERVO RETRACT (10 SECONDS) ---
+        Z_SLOW_RETRACT_SPEED = 0.01  # Matches Z_DESCENT_SPEED for consistent slow motion
+        SLOW_RETRACT_DURATION = 10.0 # Run for exactly 10 seconds
         
-        print("⬆️ [RETRACT] Lifting 50mm to clear the workspace...")
+        print(f"🐢 [SLOW RETRACT] Gently pulling screw out at {Z_SLOW_RETRACT_SPEED*1000}mm/s for {SLOW_RETRACT_DURATION}s...")
+        
+        retract_start = time.time()
+        while rclpy.ok() and (time.time() - retract_start) < SLOW_RETRACT_DURATION:
+            self.moveit_backend.jog_cartesian_servo(0.0, 0.0, Z_SLOW_RETRACT_SPEED, duration=0.1)
+            time.sleep(0.1)
+        
+        print("⬆️ [FAST RETRACT] Lifting 50mm to clear the workspace...")
         self.moveit_backend.retract_relative_z(0.050) 
         
         return True
@@ -354,7 +390,7 @@ class UnscrewSkill(Node):
             if self.perform_staircase_descent():
                 print("🏁 [FINISH] Bit is seated. Ready for unscrewing.")
                 
-                input("👉 GATE 3: Press [ENTER] to execute Force-Compliant Extraction...")
+                input("👉 GATE 3: Press [ENTER] to execute Dynamic Force-Compliant Extraction...")
                 if self.perform_compliant_extraction():
                     print("🎉 [SUCCESS] Screw successfully removed!")
                     
@@ -366,10 +402,12 @@ class UnscrewSkill(Node):
                     if world_bin_pose:
                         bx = world_bin_pose.pose.position.x
                         by = world_bin_pose.pose.position.y
-                        # DROP-OFF HEIGHT: 30mm safe hover offset
                         bz = world_bin_pose.pose.position.z + self.TOOL_LENGTH + 0.030 
                         
                         if self.moveit_backend.move_to_pose_robust(bx, by, bz):
+                            print("⏬ [WAITING] Allowing arm to settle over bin...")
+                            time.sleep(2.0)
+                            
                             print("⏬ [RELEASE] Dropping screw...")
                             drop_cmd = Int8()
                             drop_cmd.data = 3
@@ -392,7 +430,6 @@ def main(args=None):
     threading.Thread(target=executor.spin, daemon=True).start()
 
     try:
-        node.moveit_backend.reset_robot()
         time.sleep(2.0)
         while rclpy.ok():
             target_id = None

@@ -30,7 +30,7 @@ DASHBOARD_HEIGHT = 550
 PROCESSING_RATE_HZ = 15.0 
 
 # --- LOCAL VIEW ALIGNMENT SETTINGS ---
-LOCAL_CROSSHAIR_OFFSET_X = 13  # pixels
+LOCAL_CROSSHAIR_OFFSET_X = 8  # pixels
 LOCAL_CROSSHAIR_OFFSET_Y = 5   # pixels
 
 # --- IMPORT AGENTS ---
@@ -83,72 +83,94 @@ class AngleStabilizer:
         avg_sin = sum(v[1] for v in self.histories[obj_id]) / len(self.histories[obj_id])
         return math.degrees(math.atan2(avg_sin, avg_cos))
 
-class CentroidTracker:
-    """Assigns and maintains consistent IDs for detected objects across frames."""
-    def __init__(self, maxDisappeared=300, maxDistance=100):
+class Point3DStabilizer:
+    """Smooths X, Y, Z coordinates over time to prevent depth sensor jitter."""
+    def __init__(self, window_size=10):
+        self.window_size = window_size
+        self.histories = {} 
+    def update(self, obj_id, xyz):
+        if xyz is None: return None
+        if obj_id not in self.histories: self.histories[obj_id] = deque(maxlen=self.window_size)
+        self.histories[obj_id].append(xyz)
+        avg_x = sum(p[0] for p in self.histories[obj_id]) / len(self.histories[obj_id])
+        avg_y = sum(p[1] for p in self.histories[obj_id]) / len(self.histories[obj_id])
+        avg_z = sum(p[2] for p in self.histories[obj_id]) / len(self.histories[obj_id])
+        return (round(avg_x, 4), round(avg_y, 4), round(avg_z, 4))
+
+class StaticAnchorTracker:
+    """Assigns IDs based on fixed spatial anchors. Includes Deadband locking to eliminate jitter."""
+    def __init__(self, tolerance=60, maxDisappeared=1000, deadband=5.0, alpha=0.2):
         self.nextObjectID = 0
-        self.objects = OrderedDict()
-        self.objectLabels = OrderedDict() 
-        self.disappeared = OrderedDict()
+        self.anchors = {} 
+        self.tolerance = tolerance
         self.maxDisappeared = maxDisappeared
-        self.maxDistance = maxDistance
+        self.deadband = deadband # Pixels of movement to ignore entirely
+        self.alpha = alpha       # EMA smoothing factor for physical movements
+
+    def update(self, rects, labels):
+        assigned_ids = {} 
         
-    def register(self, centroid, label): 
-        self.objects[self.nextObjectID] = centroid
-        self.objectLabels[self.nextObjectID] = label
-        self.disappeared[self.nextObjectID] = 0
-        self.nextObjectID += 1
-        
-    def deregister(self, objectID):
-        del self.objects[objectID]
-        del self.objectLabels[objectID] 
-        del self.disappeared[objectID]
-        
-    def update(self, rects, labels): 
         if len(rects) == 0:
-            for objectID in list(self.disappeared.keys()):
-                self.disappeared[objectID] += 1
-                if self.disappeared[objectID] > self.maxDisappeared: self.deregister(objectID)
-            return self.objects
-            
-        inputCentroids = np.zeros((len(rects), 2), dtype="int")
-        for (i, (startX, startY, endX, endY)) in enumerate(rects):
-            cX = int((startX + endX) / 2.0); cY = int((startY + endY) / 2.0)
-            inputCentroids[i] = (cX, cY)
-            
-        if len(self.objects) == 0:
-            for i in range(0, len(inputCentroids)): self.register(inputCentroids[i], labels[i])
-        else:
-            objectIDs = list(self.objects.keys())
-            objectCentroids = list(self.objects.values())
-            D = dist.cdist(np.array(objectCentroids), inputCentroids)
-            
-            for row, obj_id in enumerate(objectIDs):
-                for col, label in enumerate(labels):
-                    if self.objectLabels[obj_id] != label:
-                        D[row, col] = 99999 
-            
-            rows, cols = linear_sum_assignment(D)
-            usedRows = set(); usedCols = set()
-            for (row, col) in zip(rows, cols):
-                if row in usedRows or col in usedCols: continue
-                if D[row, col] > self.maxDistance: continue
-                objectID = objectIDs[row]
-                self.objects[objectID] = inputCentroids[col]
-                self.disappeared[objectID] = 0
-                usedRows.add(row)
-                usedCols.add(col)
+            for obj_id in list(self.anchors.keys()):
+                self.anchors[obj_id]['disappeared'] += 1
+                if self.anchors[obj_id]['disappeared'] > self.maxDisappeared:
+                    del self.anchors[obj_id]
+            return assigned_ids
+
+        inputCentroids = []
+        for (startX, startY, endX, endY) in rects:
+            cX = int((startX + endX) / 2.0)
+            cY = int((startY + endY) / 2.0)
+            inputCentroids.append((cX, cY))
+
+        used_anchors = set()
+
+        for i, (cx, cy) in enumerate(inputCentroids):
+            label = labels[i]
+            best_id = None
+            min_dist = self.tolerance
+
+            for obj_id, anchor in self.anchors.items():
+                if obj_id in used_anchors:
+                    continue
+                if anchor['label'] != label:
+                    continue
                 
-            unusedRows = set(range(0, D.shape[0])).difference(usedRows)
-            for row in unusedRows:
-                objectID = objectIDs[row]
-                self.disappeared[objectID] += 1
-                if self.disappeared[objectID] > self.maxDisappeared: self.deregister(objectID)
+                dist = math.hypot(cx - anchor['centroid'][0], cy - anchor['centroid'][1])
+                if dist < min_dist:
+                    min_dist = dist
+                    best_id = obj_id
+
+            if best_id is not None:
+                used_anchors.add(best_id)
+                old_cx, old_cy = self.anchors[best_id]['centroid']
                 
-            unusedCols = set(range(0, D.shape[1])).difference(usedCols)
-            for col in unusedCols: self.register(inputCentroids[col], labels[col])
-            
-        return self.objects
+                # --- DEADBAND JITTER LOCK ---
+                if min_dist < self.deadband:
+                    # Movement is tiny (camera noise), heavily lock the coordinates
+                    final_cx, final_cy = old_cx, old_cy
+                else:
+                    # Object actually shifted, smoothly transition
+                    final_cx = int(self.alpha * cx + (1 - self.alpha) * old_cx)
+                    final_cy = int(self.alpha * cy + (1 - self.alpha) * old_cy)
+
+                assigned_ids[best_id] = (final_cx, final_cy)
+                self.anchors[best_id]['centroid'] = (final_cx, final_cy)
+                self.anchors[best_id]['disappeared'] = 0
+            else:
+                new_id = self.nextObjectID
+                self.nextObjectID += 1
+                self.anchors[new_id] = {'centroid': (cx, cy), 'label': label, 'disappeared': 0}
+                assigned_ids[new_id] = (cx, cy)
+                used_anchors.add(new_id)
+
+        for obj_id in list(self.anchors.keys()):
+            if obj_id not in used_anchors:
+                self.anchors[obj_id]['disappeared'] += 1
+                if self.anchors[obj_id]['disappeared'] > self.maxDisappeared:
+                    del self.anchors[obj_id]
+
+        return assigned_ids
 
 # =====================================================================
 # 4. MAIN VISION NODE
@@ -156,7 +178,7 @@ class CentroidTracker:
 class AgentNode(Node):
     def __init__(self):
         super().__init__('vision_agent_node')
-        self.get_logger().info("--- Vision System (FT300 Zeroing + Pose Keys + 3D Meters + Workspace) ---")
+        self.get_logger().info("--- Vision System (Static Tracker + XYZ Smoothing + Zeroing) ---")
 
         # --- LOAD AI MODELS ---
         try:
@@ -168,8 +190,9 @@ class AgentNode(Node):
             return
 
         # --- TRACKING & HELPERS ---
-        self.tracker = CentroidTracker(maxDisappeared=300, maxDistance=100)
+        self.tracker = StaticAnchorTracker(tolerance=60, maxDisappeared=3000)
         self.angle_stabilizer = AngleStabilizer(window_size=15)
+        self.xyz_stabilizer = Point3DStabilizer(window_size=15) # New 3D Jitter Filter
         self.bridge = CvBridge()
         
         # --- ARUCO SETUP ---
@@ -190,8 +213,8 @@ class AgentNode(Node):
         self.robot_states = {"tool_arm": "OFFLINE", "manip_arm": "OFFLINE"}
         
         # Wrench / Force Tracking
-        self.wrench_offset = None          # Stores initial baseline (tare)
-        self.latest_zeroed_wrench = None   # Stores actual value minus offset
+        self.wrench_offset = None          
+        self.latest_zeroed_wrench = None   
 
         # --- SUBSCRIBERS ---
         self.sub_global = self.create_subscription(CompressedImage, '/camera/camera/color/image_raw/compressed', self.cb_global, 10)
@@ -246,19 +269,13 @@ class AgentNode(Node):
         except: pass
         
     def cb_wrench(self, msg):
-        # Initialize zeroing offset on first message
         if self.wrench_offset is None:
             self.wrench_offset = {
-                'fx': msg.wrench.force.x,
-                'fy': msg.wrench.force.y,
-                'fz': msg.wrench.force.z,
-                'tx': msg.wrench.torque.x,
-                'ty': msg.wrench.torque.y,
-                'tz': msg.wrench.torque.z
+                'fx': msg.wrench.force.x, 'fy': msg.wrench.force.y, 'fz': msg.wrench.force.z,
+                'tx': msg.wrench.torque.x, 'ty': msg.wrench.torque.y, 'tz': msg.wrench.torque.z
             }
             self.get_logger().info("✅ Force/Torque Sensor zeroed (Tared)!")
         
-        # Calculate zeroed values by subtracting offset
         self.latest_zeroed_wrench = {
             "force": {
                 "x": msg.wrench.force.x - self.wrench_offset['fx'],
@@ -365,7 +382,6 @@ class AgentNode(Node):
         # 2c. Force & Torque
         y = 290
         if wrench_data:
-            # wrench_data is now our zeroed dictionary
             fx = wrench_data['force']['x']
             fy = wrench_data['force']['y']
             fz = wrench_data['force']['z']
@@ -478,6 +494,7 @@ class AgentNode(Node):
                 label = obj.get('label') 
                 if not box: continue
                 
+                # Raw Center
                 cx = int((box[0] + box[2]) / 2)
                 cy = int((box[1] + box[3]) / 2)
                 is_valid = False
@@ -495,17 +512,25 @@ class AgentNode(Node):
             
             for obj in valid_objects:
                 box = obj.get('box') or obj.get('bbox') or obj.get('xyxy')
-                cx = int((box[0] + box[2]) / 2)
-                cy = int((box[1] + box[3]) / 2)
+                
+                # Use raw to find matched ID
+                raw_cx = int((box[0] + box[2]) / 2)
+                raw_cy = int((box[1] + box[3]) / 2)
                 
                 obj_id = -1
                 min_dist = 9999
                 for t_id, t_center in tracked_objects.items():
-                    d = np.sqrt((cx - t_center[0])**2 + (cy - t_center[1])**2)
+                    d = np.sqrt((raw_cx - t_center[0])**2 + (raw_cy - t_center[1])**2)
                     if d < min_dist and d < 50:
                         min_dist = d
                         obj_id = t_id
                 obj['id'] = obj_id 
+                
+                # --- APPLY THE SMOOTHED/LOCKED PIXEL CENTER ---
+                if obj_id != -1 and obj_id in tracked_objects:
+                    cx, cy = tracked_objects[obj_id]
+                else:
+                    cx, cy = raw_cx, raw_cy
                 
                 segments = obj.get('segments') or obj.get('mask')
                 angle = 0.0
@@ -524,6 +549,11 @@ class AgentNode(Node):
                          angle = math.degrees(math.atan2(avg_sin, avg_cos))
 
                 xyz_meters = self.get_3d_coordinates(cx, cy, pts) 
+                
+                # --- APPLY THE SMOOTHED 3D DEPTH ---
+                if xyz_meters and obj_id != -1:
+                    xyz_meters = self.xyz_stabilizer.update(obj_id, xyz_meters)
+
                 if xyz_meters: obj['xyz'] = xyz_meters 
                 
                 obj['angle'] = angle 
@@ -559,10 +589,9 @@ class AgentNode(Node):
             h_loc, w_loc = vis_local.shape[:2]
 
             raw_sniper_data = self.sniper.target(self.frame_local)
-            sniper_data.update(raw_sniper_data) # Keep existing keys, append crosshair later
+            sniper_data.update(raw_sniper_data) 
             status = self.referee.inspect(self.frame_local)
             
-            # --- Draw Screws ---
             for s in sniper_data['screw_heads']:
                 if "box" in s:
                     box = s["box"]
@@ -572,37 +601,29 @@ class AgentNode(Node):
                     cx, cy = s["center"]
                     cv2.circle(vis_local, (cx, cy), 5, (255, 255, 0), -1) 
             
-            # --- Draw Tool Tip ---
             for t in sniper_data['tool_tips']:
                 if "contact_point" in t:
                     cx, cy = t["contact_point"]
                     cv2.circle(vis_local, (cx, cy), 5, (255, 0, 255), -1)
                     cv2.putText(vis_local, "Tool", (cx+10, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 1)
             
-            # --- Draw Holes ---
             for h in sniper_data['holes']:
                 if "box" in h:
                     box = h["box"]
                     cv2.rectangle(vis_local, (box[0], box[1]), (box[2], box[3]), (0, 0, 255), 2)
                     cv2.putText(vis_local, "Hole", (box[0], box[1]-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
 
-            # --- CALCULATE & PUBLISH CROSSHAIR ---
             cross_x = (w_loc // 2) + LOCAL_CROSSHAIR_OFFSET_X
             cross_y = (h_loc // 2) + LOCAL_CROSSHAIR_OFFSET_Y
-            sniper_data["crosshair"] = [int(cross_x), int(cross_y)] # Added to JSON data
+            sniper_data["crosshair"] = [int(cross_x), int(cross_y)] 
             
             cv2.line(vis_local, (cross_x - 20, cross_y), (cross_x + 20, cross_y), (0, 255, 0), 2)
             cv2.line(vis_local, (cross_x, cross_y - 20), (cross_x, cross_y + 20), (0, 255, 0), 2)
             cv2.circle(vis_local, (cross_x, cross_y), 2, (0, 0, 255), -1)
 
-            # --- DRAW CAMERA FRAME AXES (TOP RIGHT) ---
             ax_org_x, ax_org_y = w_loc - 60, 40
-            
-            # X Axis (Red, pointing right)
             cv2.arrowedLine(vis_local, (ax_org_x, ax_org_y), (ax_org_x + 30, ax_org_y), (0, 0, 255), 2, tipLength=0.3)
             cv2.putText(vis_local, "X", (ax_org_x + 35, ax_org_y + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-            
-            # Y Axis (Green, pointing down)
             cv2.arrowedLine(vis_local, (ax_org_x, ax_org_y), (ax_org_x, ax_org_y + 30), (0, 255, 0), 2, tipLength=0.3)
             cv2.putText(vis_local, "Y", (ax_org_x - 5, ax_org_y + 45), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
@@ -610,19 +631,17 @@ class AgentNode(Node):
             vis_local = np.zeros((480, 640, 3), dtype=np.uint8)
 
         # --- 3. BUILD JSON PACKET ---
-        # Fetching our zeroed dictionary if it exists, otherwise empty
         wrench_dict = self.latest_zeroed_wrench if self.latest_zeroed_wrench else {}
 
         packet = {
             "timestamp": timestamp,
             "global_view": {"objects": objects},
-            "local_view": sniper_data, # Now includes 'crosshair'
+            "local_view": sniper_data, 
             "assembly_state": status,
-            "force_torque": wrench_dict # Now publishes the zeroed dict
+            "force_torque": wrench_dict 
         }
         self.json_pub.publish(String(data=json.dumps(packet)))
         
-        # --- PUBLISH BIN COORDS ---
         if bin_locations: 
             self.bin_pub.publish(String(data=json.dumps(bin_locations)))
 
@@ -638,7 +657,6 @@ class AgentNode(Node):
             viz_l = resize_h(vis_local, h_target)
             top_row = np.hstack((viz_g, viz_l))
             
-            # Passing the zeroed wrench data into the dashboard
             dashboard = self.draw_wide_dashboard(top_row.shape[1], objects, bin_locations, status, self.latest_zeroed_wrench)
             final_frame = np.vstack((top_row, dashboard))
             
