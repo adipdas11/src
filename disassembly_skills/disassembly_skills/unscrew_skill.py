@@ -140,6 +140,7 @@ class UnscrewSkill(Node):
         print(f"⚖️ Baselines -> Fx: {base_fx:.2f}N | Fy: {base_fy:.2f}N | Fz: {base_fz:.2f}N")
         
         spiral_idx = 0
+        spiral_start_time = None  # 🛑 NEW: Timer for spiral search
         retry_count = 0
         MAX_RETRIES = 3
         
@@ -169,16 +170,11 @@ class UnscrewSkill(Node):
             if diff_fz > FORCE_SPIKE_THRESHOLD:
                 print(f"🎯 [CONTACT] Z-Force Spike Detected: {diff_fz:.2f}N.")
                 
-                # --- RETRY LOGIC FOR MISALIGNMENT ---
-                if dist_px > ALIGN_TOLERANCE_PX:
-                    retry_count += 1
-                    print(f"❌ [MISALIGNED] Error is {dist_px:.1f}px. Retry {retry_count}/{MAX_RETRIES}. Retracting 5mm...")
-                    self.moveit_backend.retract_relative_z(0.005) # Guaranteed 5mm lift
-                    time.sleep(1.0)
-                    if retry_count > MAX_RETRIES:
-                        return False
-                    continue
+                is_misaligned = (dist_px > ALIGN_TOLERANCE_PX)
                 
+                if is_misaligned:
+                    print(f"⚠️ [MISALIGNED] Error is {dist_px:.1f}px. Attempting wiggle test to force seating...")
+
                 print("🔩 [SEATING] Rotating screwdriver briefly to seat the bit...")
                 self.moveit_backend.jog_cartesian_servo(0.0, 0.0, 0.0, duration=0.5) 
                 
@@ -229,10 +225,14 @@ class UnscrewSkill(Node):
                     self.moveit_backend.jog_cartesian_servo(-w_dx, -w_dy, 0.0, duration=0.5)
                     time.sleep(0.5)
 
-                # --- RETRY LOGIC FOR WIGGLE FAIL ---
+                # --- RETRY LOGIC FOR WIGGLE FAIL (Handles both Misaligned and Aligned cases) ---
                 if successful_wiggles < 3:
                     retry_count += 1
-                    print(f"❌ [WIGGLE FAIL] Only {successful_wiggles}/4 wiggles succeeded. Retry {retry_count}/{MAX_RETRIES}. Retracting 5mm...")
+                    if is_misaligned:
+                        print(f"❌ [MISALIGNED & WIGGLE FAIL] Error was {dist_px:.1f}px. Retry {retry_count}/{MAX_RETRIES}. Retracting 5mm...")
+                    else:
+                        print(f"❌ [WIGGLE FAIL] Only {successful_wiggles}/4 wiggles succeeded. Retry {retry_count}/{MAX_RETRIES}. Retracting 5mm...")
+                        
                     self.moveit_backend.retract_relative_z(0.005) # Guaranteed 5mm lift
                     time.sleep(1.0) # Let forces completely settle before re-aligning
                     if retry_count > MAX_RETRIES:
@@ -245,6 +245,13 @@ class UnscrewSkill(Node):
 
             # --- VISION SERVOING & SPIRAL SEARCH ---
             if not screw:
+                # 🛑 NEW FIX: 3-Second Timeout for Spiral Search
+                if spiral_start_time is None:
+                    spiral_start_time = time.time()
+                elif (time.time() - spiral_start_time) > 15.0:
+                    print("⚠️ [TIMEOUT] Spiral search exceeded 15 seconds without finding screw. Proceeding directly to Bin 1...")
+                    return "HOLE_TIMEOUT"
+                
                 spiral_idx += 1
                 
                 theta = spiral_idx * SPIRAL_ANGULAR_STEP
@@ -267,7 +274,9 @@ class UnscrewSkill(Node):
                 time.sleep(0.3)
                 continue
 
+            # Reset spiral variables if we found the screw
             spiral_idx = 0 
+            spiral_start_time = None 
             
             if SWAP_AXES:
                 raw_joy_x = (err_y * self.MM_PER_PIX) * X_SENSE * XY_SPEED_GAIN
@@ -443,12 +452,27 @@ class UnscrewSkill(Node):
             self.wait_for_arm_settled()
             
             if interactive: input("👉 GATE 2: Press [ENTER] to start Force-Controlled Staircase Descent...")
-            if self.perform_staircase_descent():
-                print("🏁 [FINISH] Bit is seated. Ready for unscrewing.")
+            
+            # 🛑 NEW: Capture the staircase result to check for the HOLE_TIMEOUT
+            staircase_result = self.perform_staircase_descent()
+            
+            if staircase_result == True or staircase_result == "HOLE_TIMEOUT":
                 
-                if interactive: input("👉 GATE 3: Press [ENTER] to execute Dynamic Force-Compliant Extraction...")
-                if self.perform_compliant_extraction():
-                    print("🎉 [SUCCESS] Screw successfully removed!")
+                # If vision timed out on a hole, skip the extraction and safely retract
+                if staircase_result == "HOLE_TIMEOUT":
+                    print("⏭️ [SKIP EXTRACTION] Hole timeout reached. Retracting safely before moving to Bin 1...")
+                    self.moveit_backend.retract_relative_z(0.050)
+                    self.wait_for_arm_settled()
+                    extraction_success = True  # Proceed to bin
+                else:
+                    print("🏁 [FINISH] Bit is seated. Ready for unscrewing.")
+                    if interactive: input("👉 GATE 3: Press [ENTER] to execute Dynamic Force-Compliant Extraction...")
+                    extraction_success = self.perform_compliant_extraction()
+                
+                # Proceed to Drop-Off
+                if extraction_success:
+                    if staircase_result == True:
+                        print("🎉 [SUCCESS] Screw successfully removed!")
                     
                     print("🗑️ [DROP-OFF] Navigating to Bin 1...")
                     bin_pose = Pose()
