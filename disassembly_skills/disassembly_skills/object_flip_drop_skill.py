@@ -4,7 +4,7 @@ from rclpy.node import Node
 from rclpy.executors import MultiThreadedExecutor
 from std_msgs.msg import String, Bool
 from geometry_msgs.msg import Pose
-from std_srvs.srv import Trigger  # <--- NEW: Imported Trigger for the Servo Service
+from std_srvs.srv import Trigger  
 import threading, math, time
 from disassembly_skills.motion_backend import MotionBackend
 
@@ -166,8 +166,9 @@ class FlipDropSkill(Node):
         self.wait_for_arm_settled() # 🛑 ADDED POST-LIFT SETTLE
 
         # --- STEP 7: RELEASE & RESET ---
-        if interactive: input(f"🚀 STEP 7: Release Object? [Enter]")
-        self.publish_hold_status(False)
+        if interactive: input(f"🚀 STEP 7: Open slightly to drop parts, then re-grasp Chassis? [Enter]")
+        
+        # 🛑 FIX: We DO NOT publish hold_status(False) here because we are keeping the chassis!
         self.gripper.move_to_joint_positions({self.JOINT_GRIPPER: math.radians(self.OPEN_DEG)})
         self.wait_for_gripper(self.OPEN_DEG)
         
@@ -175,8 +176,11 @@ class FlipDropSkill(Node):
         self.gripper.move_to_joint_positions({self.JOINT_GRIPPER: math.radians(self.CLOSE_DEG)})
         self.wait_for_gripper(self.CLOSE_DEG)
 
-        self.get_logger().info("🎉 Skill Finished: Flipped and Dropped.")
-        self.publish_state("IDLE")
+        self.get_logger().info("🎉 Skill Finished: Loose parts dropped, Chassis re-grasped.")
+        
+        # 🛑 FIX: Broadcast that the arm is STILL holding the object
+        self.publish_state("HOLDING")
+        self.publish_hold_status(True)
         return True
 
 def main(args=None):
