@@ -15,7 +15,7 @@ class UnscrewSkill(Node):
         
         # --- Physical Parameters ---
         self.TOOL_LENGTH = 0.240       
-        self.HOVER_GAP = 0.015         
+        self.HOVER_GAP = 0.008         
         self.TRANSIT_LIFT = 0.050      
         self.REACH_LIMIT = 0.680       
         self.MM_PER_PIX = 0.000130     
@@ -106,7 +106,7 @@ class UnscrewSkill(Node):
         
         # --- ⚙️ SPEED & VELOCITY CONTROLS ---
         XY_SPEED_GAIN = 10.0      
-        Z_DESCENT_SPEED = 0.009   
+        Z_MAX_SPEED = 0.010       # 🛑 CHANGED: Max 10mm/s cap for funnel logic 
         MAX_XY_STEP = 0.025       
         
         # --- 🌀 AGGRESSIVE FAST SPIRAL SEARCH CONTROLS ---
@@ -299,9 +299,16 @@ class UnscrewSkill(Node):
                 joy_x = max(min(raw_joy_x, MAX_XY_STEP), -MAX_XY_STEP)
                 joy_y = max(min(raw_joy_y, MAX_XY_STEP), -MAX_XY_STEP)
             
-            print(f"📉 {align_state} | Fz: {diff_fz:.2f}N | ErrX: {err_x:>5.1f} | ErrY: {err_y:>5.1f} | Total: {dist_px:.1f}px")
+            # --- 🌪️ FUNNEL LOGIC FOR Z DESCENT ---
+            if dist_px <= ALIGN_TOLERANCE_PX:
+                dynamic_z_speed = Z_MAX_SPEED
+            else:
+                # Scale speed proportionally down. Floor it at 2mm/s so it doesn't freeze.
+                dynamic_z_speed = max(0.002, Z_MAX_SPEED * (ALIGN_TOLERANCE_PX / dist_px))
             
-            self.moveit_backend.jog_cartesian_servo(joy_x, joy_y, -Z_DESCENT_SPEED, duration=0.2)
+            print(f"📉 {align_state} | Fz: {diff_fz:.2f}N | ErrX: {err_x:>5.1f} | ErrY: {err_y:>5.1f} | Total: {dist_px:.1f}px | Z-Speed: {dynamic_z_speed*1000:.1f}mm/s")
+            
+            self.moveit_backend.jog_cartesian_servo(joy_x, joy_y, -dynamic_z_speed, duration=0.2)
             time.sleep(0.3) 
 
         return False

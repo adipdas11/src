@@ -118,8 +118,24 @@ class RealRobotInterface:
         except: pass
         return (self.prev_pos, [0.0]*self.dof, self.prev_eff)
 
+    def reinit_mode(self):
+        """Re-applies servo mode and ready state after a web UI reset (fixes SDK code=9)."""
+        try:
+            self.arm.clean_error()
+            self.arm.motion_enable(enable=True)
+            self.arm.set_mode(1)
+            self.arm.set_state(0)
+            self.logger.info(f"🔄 {self.name}: Mode re-initialized after web UI reset.")
+        except Exception as e:
+            self.logger.error(f"❌ {self.name}: reinit_mode failed: {e}")
+
     def set_servo_angle(self, angles):
-        if self.connected: self.arm.set_servo_angle_j(angles=angles, is_radian=True)
+        if not self.connected:
+            return
+        code = self.arm.set_servo_angle_j(angles=angles, is_radian=True)
+        if code == 9:
+            self.logger.warning(f"⚠️ {self.name}: code=9 detected — robot mode lost (web UI reset?). Re-initializing...")
+            self.reinit_mode()
 
     def set_linear_track(self, pos_meters):
         if self.connected and self.has_linear_track: 

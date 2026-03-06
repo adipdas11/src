@@ -141,11 +141,13 @@ class MotionBackend:
         
         constraints = Constraints()
         
-        # 🦾 DIRECT CHECK: Use the instance-specific flag set in __init__
+        # 🎯 THE FIX: Isolate the Gripper from the Arm
         if self.is_xarm5:
             prefixes = ['xarm5', 'slider']
+        elif 'rg6' in self.group_name:
+            prefixes = ['rg6']
         else:
-            prefixes = ['u1', 'rg6']
+            prefixes = ['u1']
         
         found_joints = False
         for name, pos in target_joints.items():
@@ -158,8 +160,6 @@ class MotionBackend:
                 found_joints = True
         
         if not found_joints:
-            # This is where your error was triggered. 
-            # It means the 'prefixes' variable was ['u1', 'rg6'] even for the xArm.
             self.node.get_logger().error(f"❌ Prefix mismatch: {prefixes} not found in target_joints.")
             return False
 
@@ -264,6 +264,31 @@ class MotionBackend:
             self.node.get_logger().error(f"TF Error: {e}")
             return None
 
+    def retract_servo_z_closed_loop(self, distance, speed_mps=0.03, timeout=20.0):
+        target_link = "xarm5_link5" if self.is_xarm5 else "u1_tool0"
+        try:
+            start_z = self.tf_buffer.lookup_transform('world_world', target_link, rclpy.time.Time()).transform.translation.z
+            target_z = start_z + distance
+        except: return False
+            
+        twist = TwistStamped()
+        twist.header.frame_id = "world_world"
+        twist.twist.linear.z = speed_mps if distance > 0 else -abs(speed_mps)
+        
+        start_t = time.time()
+        while rclpy.ok() and (time.time() - start_t) < timeout:
+            try:
+                curr_z = self.tf_buffer.lookup_transform('world_world', target_link, rclpy.time.Time()).transform.translation.z
+                if (distance > 0 and curr_z >= target_z) or (distance < 0 and curr_z <= target_z):
+                    self.servo_pub.publish(TwistStamped())
+                    return True
+            except: pass
+            twist.header.stamp = self.node.get_clock().now().to_msg()
+            self.servo_pub.publish(twist)
+            time.sleep(0.02)
+        self.servo_pub.publish(TwistStamped())
+        return False
+    
     def _execute_joint_goal(self, js, vel):
         """Standardizes joint execution across arms, grippers, and sliders."""
         goal = MoveGroup.Goal()
@@ -271,12 +296,14 @@ class MotionBackend:
         goal.request.max_velocity_scaling_factor = vel
         
         constraints = Constraints()
-        # 🦾 IMPROVED PREFIX LOGIC
-        # Logic: If it's an xarm task, take xarm+slider. If it's a UF task, take u1+rg6.
+        
+        # 🎯 THE FIX: Isolate the Gripper from the Arm
         if self.is_xarm5:
             prefixes = ['xarm5', 'slider']
+        elif 'rg6' in self.group_name:
+            prefixes = ['rg6']
         else:
-            prefixes = ['u1', 'rg6']
+            prefixes = ['u1']
 
         found_any = False
         for n, p in zip(js.name, js.position):
@@ -284,6 +311,7 @@ class MotionBackend:
             if any(n.startswith(pfx) for pfx in prefixes):
                 jc = JointConstraint()
                 jc.joint_name, jc.position, jc.weight = n, p, 1.0
+                jc.tolerance_above = jc.tolerance_below = 0.01 # Added tolerance for safety
                 constraints.joint_constraints.append(jc)
                 found_any = True
         
