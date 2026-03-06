@@ -17,6 +17,7 @@ install(
 
 install(
   PROGRAMS
+  hardware/teleop_bridge.py
   hardware/fake_hardware.py
   hardware/real_hardware.py
   hardware/state_manager.py

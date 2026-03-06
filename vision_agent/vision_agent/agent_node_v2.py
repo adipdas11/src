@@ -30,8 +30,8 @@ DASHBOARD_HEIGHT = 550
 PROCESSING_RATE_HZ = 15.0 
 
 # --- LOCAL VIEW ALIGNMENT SETTINGS ---
-LOCAL_CROSSHAIR_OFFSET_X = 5  # pixels
-LOCAL_CROSSHAIR_OFFSET_Y = 5   # pixels
+LOCAL_CROSSHAIR_OFFSET_X = 25  # pixels
+LOCAL_CROSSHAIR_OFFSET_Y = 14   # pixels
 
 # --- IMPORT AGENTS ---
 from vision_agent.agents.scout import ScoutAgent
@@ -39,8 +39,8 @@ from vision_agent.agents.sniper import SniperAgent
 from vision_agent.agents.referee import RefereeAgent
 
 # --- MODEL PATHS ---
-PATH_SCOUT = "/home/adip/workspaces/disassembly_ws/src/vision_training/train_vision_model/project 1 (segmentation)/runs/segment/hdd_scout_run/weights/best.pt"
-PATH_SNIPER = "/home/adip/workspaces/disassembly_ws/src/vision_training/train_vision_model/project 2 (keypoint)/runs/pose/hdd_final_run/weights/best.pt"
+PATH_SCOUT = "/home/adip/workspaces/disassembly_ws/src/vision_training/train_vision_model/project 1 (segmentation)/rt-detr/runs/detect/HDD_Disassembly/RTDETR_Global_1024/weights/best.pt"
+PATH_SNIPER = "/home/adip/workspaces/disassembly_ws/src/vision_training/train_vision_model/project 2 (keypoint)/rt-detr/runs/detect/HDD_Disassembly/RTDETR_Local_640/weights/best.pt"
 PATH_REFEREE = "/home/adip/workspaces/disassembly_ws/src/vision_training/train_vision_model/project 3 (classification)/runs/classify/hdd_referee_model/weights/best.pt"
 
 # --- ARUCO ZONE CONFIGURATION ---
@@ -238,10 +238,8 @@ class AgentNode(Node):
     def cb_reset_request(self, msg):
         """Clears all stored tracking IDs and smoothing history."""
         self.get_logger().info("♻️ RESETTING TRACKER AND STABILIZERS...")
-        # Clear tracker anchors and reset ID count
         self.tracker.anchors.clear()
         self.tracker.nextObjectID = 0
-        # Clear smoothing history for all filters
         self.angle_stabilizer.histories.clear()
         self.xyz_stabilizer.histories.clear()
         self.buffers.clear()
@@ -590,27 +588,53 @@ class AgentNode(Node):
             sniper_data.update(raw_sniper_data) 
             status = self.referee.inspect(self.frame_local)
             
+            # --- LOCAL VISUALIZATION OVERHAUL: BULLETPROOF CENTER CALCULATION ---
             for s in sniper_data['screw_heads']:
                 if "box" in s:
                     box = s["box"]
+                    cx = int((box[0] + box[2]) / 2)
+                    cy = int((box[1] + box[3]) / 2)
+                    
+                    # 1. PUSH TO DICTIONARY (Ensures it goes to JSON)
+                    s["center"] = [cx, cy]
+                    
+                    # 2. Draw Visuals
                     cv2.rectangle(vis_local, (box[0], box[1]), (box[2], box[3]), (255, 255, 0), 2)
                     cv2.putText(vis_local, "Screw", (box[0], box[1]-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
-                if "center" in s:
-                    cx, cy = s["center"]
                     cv2.circle(vis_local, (cx, cy), 5, (255, 255, 0), -1) 
             
             for t in sniper_data['tool_tips']:
-                if "contact_point" in t:
-                    cx, cy = t["contact_point"]
+                if "box" in t:
+                    box = t["box"]
+                    cx = int((box[0] + box[2]) / 2)
+                    cy = int((box[1] + box[3]) / 2)
+                    
+                    # 1. PUSH TO DICTIONARY (Ensures it goes to JSON)
+                    t["contact_point"] = [cx, cy]
+                    
+                    # 2. Draw Visuals
                     cv2.circle(vis_local, (cx, cy), 5, (255, 0, 255), -1)
                     cv2.putText(vis_local, "Tool", (cx+10, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 1)
+                elif "contact_point" in t: # Fallback in case old code runs
+                    cx, cy = t["contact_point"]
+                    cv2.circle(vis_local, (int(cx), int(cy)), 5, (255, 0, 255), -1)
+                    cv2.putText(vis_local, "Tool", (int(cx)+10, int(cy)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 1)
             
             for h in sniper_data['holes']:
                 if "box" in h:
                     box = h["box"]
+                    cx = int((box[0] + box[2]) / 2)
+                    cy = int((box[1] + box[3]) / 2)
+                    
+                    # 1. PUSH TO DICTIONARY (Ensures it goes to JSON)
+                    h["center"] = [cx, cy]
+                    
+                    # 2. Draw Visuals
                     cv2.rectangle(vis_local, (box[0], box[1]), (box[2], box[3]), (0, 0, 255), 2)
                     cv2.putText(vis_local, "Hole", (box[0], box[1]-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+                    cv2.circle(vis_local, (cx, cy), 3, (0, 0, 255), -1)
 
+            # --- CROSSHAIR ---
             cross_x = (w_loc // 2) + LOCAL_CROSSHAIR_OFFSET_X
             cross_y = (h_loc // 2) + LOCAL_CROSSHAIR_OFFSET_Y
             sniper_data["crosshair"] = [int(cross_x), int(cross_y)] 
@@ -619,6 +643,7 @@ class AgentNode(Node):
             cv2.line(vis_local, (cross_x, cross_y - 20), (cross_x, cross_y + 20), (0, 255, 0), 2)
             cv2.circle(vis_local, (cross_x, cross_y), 2, (0, 0, 255), -1)
 
+            # Axis Lines
             ax_org_x, ax_org_y = w_loc - 60, 40
             cv2.arrowedLine(vis_local, (ax_org_x, ax_org_y), (ax_org_x + 30, ax_org_y), (0, 0, 255), 2, tipLength=0.3)
             cv2.putText(vis_local, "X", (ax_org_x + 35, ax_org_y + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)

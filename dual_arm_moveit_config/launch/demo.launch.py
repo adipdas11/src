@@ -1,4 +1,5 @@
 import os
+import yaml
 from launch import LaunchDescription
 from launch.actions import (DeclareLaunchArgument, IncludeLaunchDescription, 
                             ExecuteProcess, TimerAction, OpaqueFunction, 
@@ -18,13 +19,17 @@ def launch_setup(context, *args, **kwargs):
     pkg_share = get_package_share_directory(moveit_config_pkg)
     rviz_config_file = os.path.join(pkg_share, "rviz", "dual_arm.rviz")
     
-    # 1. Load MoveIt Config
+    # 1. Load MoveIt Config 
     moveit_config = (
         MoveItConfigsBuilder("dual_arm_world", package_name=moveit_config_pkg)
-        .robot_description(file_path=os.path.join(pkg_share, "config", "dual_arm_world.urdf"))
+        .robot_description(
+            file_path=os.path.join(pkg_share, "config", "dual_arm_world.urdf.xacro"),
+            mappings={"hw_type": hw_type}
+        )
         .robot_description_semantic(file_path=os.path.join(pkg_share, "config", "dual_arm_world.srdf"))
         .robot_description_kinematics(file_path="config/kinematics.yaml")
         .trajectory_execution(file_path="config/moveit_controllers.yaml")
+        .planning_pipelines(pipelines=["ompl"])
         .to_moveit_configs()
     )
 
@@ -39,45 +44,35 @@ def launch_setup(context, *args, **kwargs):
         parameters=[moveit_config.robot_description],
     )
 
-    # 3. Hardware Nodes
-    hardware_actions = []
-    if hw_type == 'real':
-        # FT Sensor
-        ft_sensor_launch = IncludeLaunchDescription(
-            PythonLaunchDescriptionSource(os.path.join(
-                get_package_share_directory('robotiq_ft_sensor_hardware'),
-                'launch', 'ft_sensor_standalone.launch.py'))
-        )
-        # Real Hardware Driver (with on_exit shutdown)
-        real_hw_process = ExecuteProcess(
-            cmd=['ros2', 'run', 'dual_arm_moveit_config', 'real_hardware.py'],
-            output='screen',
-            on_exit=Shutdown()
-        )
-        hardware_actions = [
-            LogInfo(msg="🔌 Launching REAL hardware drivers and FT sensor..."),
-            real_hw_process,
-            ft_sensor_launch
-        ]
-    else:
-        # Fake Hardware
-        fake_hw_process = ExecuteProcess(
-            cmd=['ros2', 'run', 'dual_arm_moveit_config', 'fake_hardware.py'],
-            output='screen'
-        )
-        hardware_actions = [
-            LogInfo(msg="💻 Launching FAKE hardware simulation..."),
-            fake_hw_process
-        ]
+    # 3. Hardware Nodes & Logic
+    ros2_controllers_path = os.path.join(pkg_share, "config", "ros2_controllers.yaml")
 
-    # 4. Tools & Perception (UPDATED)
+    ros2_control_node = Node(
+        package="controller_manager",
+        executable="ros2_control_node",
+        parameters=[moveit_config.robot_description, ros2_controllers_path],
+        output="screen",
+    )
+
+    ft_sensor_launch = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(os.path.join(
+            get_package_share_directory('robotiq_ft_sensor_hardware'),
+            'launch', 'ft_sensor_standalone.launch.py'))
+    )
+    
+    real_hw_process = ExecuteProcess(
+        cmd=['ros2', 'run', 'dual_arm_moveit_config', 'real_hardware.py'],
+        output='screen',
+        on_exit=Shutdown()
+    )
+
+    # 4. Tools & Perception
     tool_controller = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(os.path.join(
             get_package_share_directory('tool_controller'),
             'launch', 'tool_launch.py'))
     )
 
-    # Hand-Eye Calibration Publisher
     handeye_publisher = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(os.path.join(
             get_package_share_directory('easy_handeye2'),
@@ -88,7 +83,7 @@ def launch_setup(context, *args, **kwargs):
         }.items()
     )
 
-    # 5. MoveGroup & RViz
+    # 5. MoveGroup, RViz & Custom Nodes
     run_move_group_node = Node(
         package="moveit_ros_move_group", executable="move_group",
         parameters=[moveit_config.to_dict(), {"use_sim_time": False}],
@@ -100,63 +95,135 @@ def launch_setup(context, *args, **kwargs):
         parameters=[moveit_config.to_dict()],
     )
     
-    state_manager = ExecuteProcess(
-            cmd=['ros2', 'run', 'dual_arm_moveit_config', 'state_manager.py'],
-            output='screen',
-            on_exit=Shutdown()
-        )
+    state_manager = ExecuteProcess(cmd=['ros2', 'run', 'dual_arm_moveit_config', 'state_manager.py'], output='screen', on_exit=Shutdown())
+    hold_state = ExecuteProcess(cmd=['ros2', 'run', 'dual_arm_moveit_config', 'object_hold_state.py'], output='screen', on_exit=Shutdown())
     
-    hold_state = ExecuteProcess(
-            cmd=['ros2', 'run', 'dual_arm_moveit_config', 'object_hold_state.py'],
-                output='screen',
-                on_exit=Shutdown()
-        )
+    # ==========================================
+    # DUAL-ARM SERVO CONFIGURATION
+    # ==========================================
+    
+    # Load xArm5 Servo Config
+    xarm_servo_yaml = os.path.join(pkg_share, 'config', 'xarm_servo.yaml')
+    with open(xarm_servo_yaml, 'r') as file:
+        xarm_servo_params = yaml.safe_load(file)
 
-    # 6. Execution Sequence
-    return [
+    xarm_servo_node = Node(
+        package="moveit_servo",
+        executable="servo_node_main",
+        name="xarm_servo_node",
+        parameters=[
+            {"moveit_servo": xarm_servo_params},
+            {"use_sim_time": False},
+            moveit_config.robot_description,
+            moveit_config.robot_description_semantic,
+            moveit_config.robot_description_kinematics,
+        ],
+        output="screen",
+    )
+
+    # Load UF850 Servo Config
+    uf_servo_yaml = os.path.join(pkg_share, 'config', 'uf_servo.yaml')
+    with open(uf_servo_yaml, 'r') as file:
+        uf_servo_params = yaml.safe_load(file)
+
+    uf_servo_node = Node(
+        package="moveit_servo",
+        executable="servo_node_main",
+        name="uf_servo_node",
+        parameters=[
+            {"moveit_servo": uf_servo_params}, 
+            {"use_sim_time": False},
+            moveit_config.robot_description,
+            moveit_config.robot_description_semantic,
+            moveit_config.robot_description_kinematics,
+        ],
+        output="screen",
+    )
+    
+    teleoperate = ExecuteProcess(cmd=['ros2', 'run', 'joy', 'joy_node'], output='screen', on_exit=Shutdown())
+    
+    teleop_bridge = ExecuteProcess(
+        cmd=['ros2', 'run', 'dual_arm_moveit_config', 'teleop_bridge.py'], 
+        output='screen', 
+        on_exit=Shutdown()
+    )
+
+    # ==========================================
+    # ROS 2 Controller Spawners
+    # ==========================================
+    jsb_spawner = Node(package="controller_manager", executable="spawner", arguments=["joint_state_broadcaster", "--controller-manager", "/controller_manager"])
+    xarm_spawner = Node(package="controller_manager", executable="spawner", arguments=["xarm_controller", "--controller-manager", "/controller_manager"])
+    uf_spawner = Node(package="controller_manager", executable="spawner", arguments=["uf_controller", "--controller-manager", "/controller_manager"])
+    rg6_spawner = Node(package="controller_manager", executable="spawner", arguments=["rg6_controller", "--controller-manager", "/controller_manager"])
+    slider_spawner = Node(package="controller_manager", executable="spawner", arguments=["slider_controller", "--controller-manager", "/controller_manager"])
+
+    # ==========================================
+    # 6. STRICT EXECUTION SEQUENCE (THE FIX)
+    # ==========================================
+    launch_sequence = [
         LogInfo(msg="🛰️  Step 1: Loading Robot State and Static TFs..."),
         static_tf,
         run_rsp_node,
-
-        TimerAction(period=4.0, actions=[
-            LogInfo(msg="🦾 Step 2: Initializing Hardware..."),
-            *hardware_actions
-        ]),
-
-        TimerAction(period=8.0, actions=[
-            LogInfo(msg="🔧 Step 3: Launching Tool Controller & Hand-Eye Calibration..."),
-            tool_controller,
-            handeye_publisher
-        ]),
-
-        TimerAction(period=12.0, actions=[
-            LogInfo(msg="🧠 Step 4: Starting MoveGroup Brain..."),
-            run_move_group_node
-        ]),
-        
-        TimerAction(period=14.0, actions=[
-            LogInfo(msg="✅ Step 4: Starting State Manager..."),
-            state_manager
-        ]),
-        
-        TimerAction(period=14.5, actions=[
-            LogInfo(msg="✅ Step 4: Starting Object Hold State Manager..."),
-            hold_state
-        ]),
-
-        TimerAction(period=16.0, actions=[
-            LogInfo(msg="📊 Step 5: Opening RViz Visualization..."),
-            run_rviz_node,
-            LogInfo(msg="✅ SYSTEM READY. Happy Disassembling!")
-        ]),
-        
     ]
+
+    # Hardware-specific execution timing
+    if hw_type == 'real':
+        launch_sequence.append(
+            TimerAction(period=2.0, actions=[
+                LogInfo(msg="🔌 Step 2A: Booting Python Hardware API... (Waiting for Real Pose)"),
+                real_hw_process,
+                ft_sensor_launch
+            ])
+        )
+        launch_sequence.append(
+            TimerAction(period=8.0, actions=[
+                LogInfo(msg="⚙️ Step 2B: Starting ROS 2 Control Node (Topics are now populated)..."),
+                ros2_control_node
+            ])
+        )
+    elif hw_type == 'fake':
+        launch_sequence.append(
+            TimerAction(period=2.0, actions=[
+                LogInfo(msg="💻 Step 2: Launching Controller Manager (Mock Fake Hardware)..."),
+                ros2_control_node
+            ])
+        )
+    elif hw_type == 'isaac':
+        launch_sequence.append(
+            LogInfo(msg="🌌 Step 2: Waiting for Isaac Sim to host the Controller Manager...")
+        )
+
+    # Remaining sequence starts safely AFTER Step 2B
+    launch_sequence.extend([
+        TimerAction(period=12.0, actions=[
+            LogInfo(msg="📡 Step 3: Spawning Broadcaster & Controllers..."),
+            jsb_spawner, xarm_spawner, uf_spawner, rg6_spawner, slider_spawner
+        ]),
+
+        TimerAction(period=15.0, actions=[
+            LogInfo(msg="🧠 Step 4: Starting MoveGroup, Tools, & Perception..."),
+            run_move_group_node, tool_controller, handeye_publisher
+        ]),
+
+        TimerAction(period=18.0, actions=[
+            LogInfo(msg="🕹️  Step 5: Starting Teleop & MoveIt Servo..."),
+            teleoperate, teleop_bridge, xarm_servo_node, uf_servo_node
+        ]),
+
+        TimerAction(period=21.0, actions=[
+            LogInfo(msg="✅ Step 6: Starting Managers & RViz..."),
+            state_manager, hold_state, run_rviz_node,
+            LogInfo(msg="🚀 SYSTEM READY. NO JUMPS ALLOWED.")
+        ])
+    ])
+
+    return launch_sequence
 
 def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument(
             'hardware_type',
             default_value='fake',
-            description='Select hardware type: "real" or "fake"'),
+            description='Select hardware type: "real", "fake", or "isaac"'),
         OpaqueFunction(function=launch_setup)
     ])

@@ -1,0 +1,44 @@
+###############################################
+# xArm5 Servo Configuration
+###############################################
+use_gazebo: false
+command_in_type: unitless
+scale:
+  linear:  0.8  
+  rotational:  0.8 
+  joint: 0.5 
+
+# What to publish?
+command_out_topic: /xarm_controller/joint_trajectory
+command_out_type: trajectory_msgs/JointTrajectory
+
+# What to listen to? (UPDATED FOR TELEOP BRIDGE)
+command_in_topic: "/xarm_servo_node/delta_twist_cmds"
+joint_topic: /joint_states
+
+# Frame settings
+robot_link_command_frame: xarm5_link5  
+planning_frame: sd1_base_link 
+ee_frame_name: xarm5_link5         
+
+# Collision checking
+check_collisions: false
+collision_check_rate: 10.0
+collision_check_type: threshold_distance
+self_collision_proximity_threshold: 0.01 
+scene_collision_proximity_threshold: 0.02 
+
+# Loop rates
+publish_period: 0.02
+low_pass_filter_coeff: 1.0  
+incoming_command_timeout: 0.5 
+use_halt_position_resolution: false
+num_outgoing_halo_msgs: 4 
+
+# IK Settings
+move_group_name: xarm_arm
+is_primary_planning_scene_monitor: false
+lower_singularity_threshold:  30.0  
+hard_stop_singularity_threshold: 60.0  
+joint_limit_margin: 0.05
+drift_dimensions: [false, false, false, false, false, true]
