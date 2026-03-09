@@ -4,7 +4,7 @@
 use_gazebo: false
 command_in_type: unitless
 scale:
-  linear:  0.8  
+  linear:  0.4  
   rotational:  0.8 
   joint: 0.5 
 
@@ -30,8 +30,8 @@ scene_collision_proximity_threshold: 0.02
 
 # Loop rates
 publish_period: 0.02
-low_pass_filter_coeff: 1.0  
-incoming_command_timeout: 0.5 
+low_pass_filter_coeff: 0.3  
+incoming_command_timeout: 0.2 
 use_halt_position_resolution: false
 num_outgoing_halo_msgs: 4 
 

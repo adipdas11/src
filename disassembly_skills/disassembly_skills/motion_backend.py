@@ -233,6 +233,13 @@ class MotionBackend:
 
     def jog_cartesian_servo(self, dx, dy, dz, duration=1.0):
         """Fine-grained cartesian jogging via MoveIt Servo."""
+        # Flush: send zero-twist first to ensure servo takes control cleanly
+        flush = TwistStamped()
+        flush.header.frame_id = "world_world"
+        flush.header.stamp = self.node.get_clock().now().to_msg()
+        self.servo_pub.publish(flush)
+        time.sleep(0.02)
+
         twist = TwistStamped(); twist.header.frame_id = "world_world"
         twist.twist.linear.x, twist.twist.linear.y, twist.twist.linear.z = dx, dy, dz
         end_t = time.time() + duration
@@ -290,7 +297,9 @@ class MotionBackend:
         return False
     
     def _execute_joint_goal(self, js, vel):
-        """Standardizes joint execution across arms, grippers, and sliders."""
+        """Standardizes joint execution across arms, grippers, and sliders.
+        IMPORTANT: Blocks until trajectory execution is complete to prevent
+        controller fight with MoveIt Servo."""
         goal = MoveGroup.Goal()
         goal.request.group_name = self.group_name
         goal.request.max_velocity_scaling_factor = vel
@@ -317,10 +326,31 @@ class MotionBackend:
         
         if not found_any:
             self.node.get_logger().error(f"❌ No joints matching {prefixes} found in message!")
-            return
+            return False
 
         goal.request.goal_constraints.append(constraints)
-        self._action_client.send_goal_async(goal)
+
+        # 🛑 CRITICAL FIX: Wait for goal acceptance AND completion.
+        # Previously this was fire-and-forget (send_goal_async without waiting),
+        # which caused the trajectory controller to still be executing when
+        # MoveIt Servo started sending commands — resulting in violent oscillation.
+        future = self._action_client.send_goal_async(goal)
+        while not future.done():
+            time.sleep(0.01)
+
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            self.node.get_logger().error("❌ Joint Goal Rejected by MoveIt.")
+            return False
+
+        result_future = goal_handle.get_result_async()
+        while not result_future.done():
+            time.sleep(0.01)
+
+        success = result_future.result().result.error_code.val == 1
+        if not success:
+            self.node.get_logger().warn(f"⚠️ Trajectory execution returned non-success code.")
+        return success
 
     def _call_ik_sync(self, req):
         future = self._ik_client.call_async(req)
