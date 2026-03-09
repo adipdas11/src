@@ -7,15 +7,12 @@ from moveit_msgs.msg import Constraints, JointConstraint, RobotState
 from moveit_msgs.srv import GetPositionIK, GetCartesianPath
 from geometry_msgs.msg import PoseStamped, Quaternion, Pose, TwistStamped
 from sensor_msgs.msg import JointState
+from std_srvs.srv import Trigger
 import tf2_ros
 from tf2_ros import Buffer, TransformListener
 import tf2_geometry_msgs 
 import threading, math, time, os, subprocess
-try:
-    from controller_manager_msgs.srv import SwitchController
-    _HAS_SWITCH_CTRL = True
-except ImportError:
-    _HAS_SWITCH_CTRL = False
+
 
 class MotionBackend:
     def __init__(self, node: Node, group_name: str):
@@ -54,15 +51,7 @@ class MotionBackend:
         self.joint_sub = self.node.create_subscription(JointState, '/joint_states', self._joint_state_callback, 10)
         
         self.is_activated = False
-
-        # --- Controller Mode Tracking ---
         self._in_servo_mode = False
-        if _HAS_SWITCH_CTRL:
-            self._switch_ctrl_client = self.node.create_client(
-                SwitchController, '/controller_manager/switch_controller')
-        else:
-            self._switch_ctrl_client = None
-
     def _joint_state_callback(self, msg):
         for i, name in enumerate(msg.name):
             self.current_joint_positions[name] = msg.position[i]
@@ -99,73 +88,50 @@ class MotionBackend:
         self.node.get_logger().error("🛑 MOTION STOPPED")
 
     # --- Controller Mode Switching ---
+    # IMPORTANT: MoveIt Servo publishes TO the JointTrajectoryController.
+    # We must NEVER deactivate the trajectory controller — if we do, servo
+    # commands have no subscriber and the robot won't move.
+    # Instead, we prevent fights by:
+    #   1. Blocking until planned trajectories complete (_execute_joint_goal)
+    #   2. Flushing servo with zero-twist before planned motions
+    #   3. Tracking mode state to avoid redundant flushes
+
     def _ensure_servo_mode(self):
-        """Deactivate trajectory controller so servo commands don't fight it."""
+        """Prepare for servo jogging. The trajectory controller stays active
+        (servo publishes through it). We just track the mode."""
         if self._in_servo_mode:
             return True
-        if not self._switch_ctrl_client:
-            self._in_servo_mode = True
-            return True
-        if not self._switch_ctrl_client.wait_for_service(timeout_sec=2.0):
-            self.node.get_logger().warn("⚠️ Controller manager not available — skipping switch.")
-            self._in_servo_mode = True
-            return True
-
-        req = SwitchController.Request()
-        req.deactivate_controllers = [self.controller_name]
-        req.strictness = SwitchController.Request.BEST_EFFORT
-        req.activate_asap = True
-
-        future = self._switch_ctrl_client.call_async(req)
-        t0 = time.time()
-        while not future.done():
-            if time.time() - t0 > 5.0:
-                self.node.get_logger().error("❌ Controller switch timeout.")
-                return False
-            time.sleep(0.01)
-
-        ok = future.result().ok
-        if ok:
-            self.node.get_logger().info(f"🔄 Deactivated {self.controller_name} → servo mode.")
-            self._in_servo_mode = True
-            time.sleep(0.3)  # Brief settle for controller transition
-        else:
-            self.node.get_logger().warn(f"⚠️ Failed to deactivate {self.controller_name}.")
-        return ok
+        self._in_servo_mode = True
+        self.node.get_logger().info(f"🔄 Entering servo mode (controller stays active).")
+        return True
 
     def _ensure_trajectory_mode(self):
-        """Re-activate trajectory controller for MoveGroup / planned motions."""
+        """Prepare for planned trajectory execution. Flush any lingering servo
+        commands by sending zero-twist, then explicitly stop the servo node
+        to switch the xArm driver back to position control mode."""
         if not self._in_servo_mode:
             return True
-        if not self._switch_ctrl_client:
-            self._in_servo_mode = False
-            return True
-        if not self._switch_ctrl_client.wait_for_service(timeout_sec=2.0):
-            self.node.get_logger().warn("⚠️ Controller manager not available — skipping switch.")
-            self._in_servo_mode = False
-            return True
-
-        req = SwitchController.Request()
-        req.activate_controllers = [self.controller_name]
-        req.strictness = SwitchController.Request.BEST_EFFORT
-        req.activate_asap = True
-
-        future = self._switch_ctrl_client.call_async(req)
-        t0 = time.time()
-        while not future.done():
-            if time.time() - t0 > 5.0:
-                self.node.get_logger().error("❌ Controller switch timeout.")
-                return False
-            time.sleep(0.01)
-
-        ok = future.result().ok
-        if ok:
-            self.node.get_logger().info(f"🔄 Re-activated {self.controller_name} → trajectory mode.")
-            self._in_servo_mode = False
-            time.sleep(0.3)  # Brief settle for controller transition
-        else:
-            self.node.get_logger().warn(f"⚠️ Failed to re-activate {self.controller_name}.")
-        return ok
+            
+        # Flush servo: send zero-twist to stop any residual servo motion
+        flush = TwistStamped()
+        flush.header.frame_id = "world_world"
+        flush.header.stamp = self.node.get_clock().now().to_msg()
+        self.servo_pub.publish(flush)
+        time.sleep(0.1)  # Brief settle for servo to process the halt
+        
+        # 🎯 THE FIX: Explicitly call stop_servo to release hardware control
+        # If we don't do this, the arm stays in velocity mode and ignores trajectory commands!
+        stop_client = self.node.create_client(Trigger, f'/{self.prefix}_servo_node/stop_servo')
+        if stop_client.wait_for_service(timeout_sec=1.0):
+            req_f = stop_client.call_async(Trigger.Request())
+            # Wait for response
+            start_wait = time.time()
+            while rclpy.ok() and not req_f.done() and (time.time() - start_wait < 1.0):
+                time.sleep(0.01)
+        
+        self._in_servo_mode = False
+        self.node.get_logger().info(f"🔄 Entering trajectory mode (servo stopped).")
+        return True
 
     # --- Core Motion Logic ---
     def move_to_pose_robust(self, x, y, z, q_dict=None, velocity=0.1, frame_id='world_world'):
@@ -356,6 +322,7 @@ class MotionBackend:
 
     def move_linear_z_with_torque_stop(self, speed_mps, threshold_nm, joint_index=4):
         """Tactile descent using MoveIt Servo and baseline-subtraction monitoring."""
+        self._ensure_servo_mode()
         arm_pfx = 'xarm5' if self.is_xarm5 else 'u1'
         joint_name = f"{arm_pfx}_joint{joint_index+1}"
         
@@ -401,6 +368,7 @@ class MotionBackend:
 
     def jog_cartesian_servo(self, dx, dy, dz, duration=1.0):
         """Fine-grained cartesian jogging via MoveIt Servo."""
+        self._ensure_servo_mode()
         twist = TwistStamped(); twist.header.frame_id = "world_world"
         twist.twist.linear.x, twist.twist.linear.y, twist.twist.linear.z = dx, dy, dz
         end_t = time.time() + duration
@@ -432,7 +400,8 @@ class MotionBackend:
             self.node.get_logger().error(f"TF Error: {e}")
             return None
 
-    def retract_servo_z_closed_loop(self, distance, speed_mps=0.03, timeout=20.0):
+    def retract_servo_z_closed_loop(self, distance, speed_mps=0.03, timeout=60.0):
+        self._ensure_servo_mode()
         target_link = "xarm5_link5" if self.is_xarm5 else "u1_tool0"
         try:
             start_z = self.tf_buffer.lookup_transform('world_world', target_link, rclpy.time.Time()).transform.translation.z
@@ -455,18 +424,19 @@ class MotionBackend:
                 curr_z = self.tf_buffer.lookup_transform('world_world', target_link, rclpy.time.Time()).transform.translation.z
                 tf_fail_count = 0  # reset on success
 
-                # Motion sanity check at 2s — servo might be dead (controller conflict)
-                if not motion_checked and (time.time() - start_t) > 2.0:
+                # Motion sanity check at 3s — warn but don't abort
+                if not motion_checked and (time.time() - start_t) > 3.0:
                     motion_checked = True
                     moved = abs(curr_z - start_z)
-                    expected = abs(distance) * 0.25  # at least 25% progress
-                    if moved < expected:
+                    if moved < 0.001:  # Less than 1mm in 3s = truly stuck
                         self.servo_pub.publish(TwistStamped())
                         self.node.get_logger().error(
-                            f"❌ Servo retract aborted: no motion detected after 2s "
-                            f"(moved {moved*1000:.1f}mm, expected >{expected*1000:.1f}mm). "
-                            f"Servo controller may be inactive.")
+                            f"❌ Servo retract aborted: zero motion after 3s "
+                            f"(moved {moved*1000:.1f}mm). Servo may be inactive.")
                         return False
+                    elif moved < abs(distance) * 0.10:  # Less than 10% = slow but moving
+                        self.node.get_logger().warn(
+                            f"⚠️ Slow servo retract: {moved*1000:.1f}mm in 3s. Continuing...")
 
                 if (distance > 0 and curr_z >= target_z) or (distance < 0 and curr_z <= target_z):
                     self.servo_pub.publish(TwistStamped())

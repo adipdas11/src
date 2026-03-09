@@ -61,20 +61,20 @@ class HDDDisassemblyScript(Node):
             filtered = []
             for o in raw:
                 xyz = o.get("xyz")
-                if xyz and len(xyz) >= 3:
-                    skip = False
-                    for cz in self.cleared_zones:
-                        dist = math.hypot(
-                            xyz[0] - cz[0],
-                            xyz[1] - cz[1],
-                            xyz[2] - cz[2],
-                        )
-                        if dist < self.EXCLUSION_RADIUS:
-                            skip = True
-                            break
-                    if skip:
-                        continue
-                filtered.append(o)
+                if not xyz or len(xyz) < 3:
+                    continue  # Skip objects with no position data
+                skip = False
+                for cz in self.cleared_zones:
+                    dist = math.hypot(
+                        xyz[0] - cz[0],
+                        xyz[1] - cz[1],
+                        xyz[2] - cz[2],
+                    )
+                    if dist < self.EXCLUSION_RADIUS:
+                        skip = True
+                        break
+                if not skip:
+                    filtered.append(o)
             with self.vision_lock:
                 self.detected_objects = filtered
             self.vision_received.set()

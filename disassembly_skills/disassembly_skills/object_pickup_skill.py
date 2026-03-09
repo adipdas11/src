@@ -103,45 +103,112 @@ class PickupSkill(Node):
         final_z = world_p.pose.position.z + self.UF_TOOL_LENGTH
         hover_z = final_z + self.HOVER_HEIGHT
 
-        # --- STEP 3: APPROACH & CLOSED-LOOP DESCENT ---
+        # --- STEP 3: APPROACH WITH GRIPPER OPEN ---
         print("🔓 Opening Gripper for Approach...")
         if not self.gripper.move_to_joint_positions({"rg6_l_out": math.radians(self.OPEN_DEG)}): return False
         
-        print(f"🚁 Hovering at {tx:.3f}, {ty:.3f}...")
+        print(f"🚁 Hovering at {tx:.3f}, {ty:.3f}, {hover_z:.3f}...")
         if not self.uf850.move_to_pose_robust(tx, ty, hover_z, velocity=0.1): return False
         self.wait_for_settled(self.uf850)
 
-        print("⏰ Activating Servo & Closed-Loop Descent (0.1m/s)...")
+        # --- STEP 4: CLOSE GRIPPER TO 0° (NEUTRAL/PARTIAL) ---
+        print("🗜️ Closing Gripper to 0° (neutral position for descent)...")
+        if not self.gripper.move_to_joint_positions({"rg6_l_out": math.radians(0.0)}): return False
+        time.sleep(0.5)
+
+        # --- STEP 5: TACTILE DESCENT (u1_joint3 effort monitoring) ---
+        print("⏰ Activating Servo for Tactile Descent...")
         if self.uf_servo_start_client.wait_for_service(timeout_sec=5.0):
             req_f = self.uf_servo_start_client.call_async(Trigger.Request())
             while rclpy.ok() and not req_f.done(): time.sleep(0.01)
         else: return False
-        time.sleep(1.0)  # Allow controller transition to complete
+        time.sleep(1.0)  # Allow servo to initialize
 
-        if not self.uf850.retract_servo_z_closed_loop(-self.HOVER_HEIGHT, speed_mps=self.DESCENT_SPEED): return False
+        print("📉 Tactile Descent: Monitoring u1_joint3 effort (threshold: 3.0Nm)...")
+        # joint_index=2 → monitors u1_joint3 effort for spike detection
+        contact = self.uf850.move_linear_z_with_torque_stop(
+            speed_mps=0.08, threshold_nm=3.0, joint_index=2)
+        
+        if not contact:
+            print("❌ [ERROR] Tactile descent failed — no contact detected. Aborting.")
+            return False
+        
+        print("🎯 Contact detected on u1_joint3! Stopping and retracting...")
         self.wait_for_settled(self.uf850)
 
-        # --- STEP 4: GRASP & RETRACT ---
-        print("🗜️ Closing Gripper on PCB...")
+        # --- STEP 6: RETRACT 1cm THEN GRASP ---
+        print("⬆️ Retracting 1cm before grasping...")
+        # Re-activate servo for retract (may have timed out during settle)
+        if self.uf_servo_start_client.wait_for_service(timeout_sec=2.0):
+            req_f = self.uf_servo_start_client.call_async(Trigger.Request())
+            while rclpy.ok() and not req_f.done(): time.sleep(0.01)
+        time.sleep(0.5)
+
+        if not self.uf850.retract_servo_z_closed_loop(0.01, speed_mps=0.03):
+            print("⚠️ Servo retract failed. Trying planned retract...")
+            if not self.uf850.retract_relative_z(0.01):
+                return False
+        self.wait_for_settled(self.uf850)
+
+        # --- STEP 7: FULL GRIPPER CLOSE ---
+        print("🗜️ Closing Gripper fully on PCB...")
         if not self.gripper.move_to_joint_positions({"rg6_l_out": math.radians(self.CLOSE_DEG)}): return False
-        time.sleep(1.5); self.hold_status_pub.publish(Bool(data=True))
+        time.sleep(1.5)
+        self.hold_status_pub.publish(Bool(data=True))
 
-        print(f"⬆️ Retracting {self.RETRACT_DIST*1000}mm...")
-        if not self.uf850.retract_servo_z_closed_loop(self.RETRACT_DIST): return False
+        # --- STEP 8: RETRACT 3cm TO CLEAR SURROUNDINGS ---
+        print("⬆️ Retracting 3cm to clear surroundings...")
+        # Re-activate servo (timed out during gripper close)
+        if self.uf_servo_start_client.wait_for_service(timeout_sec=2.0):
+            req_f = self.uf_servo_start_client.call_async(Trigger.Request())
+            while rclpy.ok() and not req_f.done(): time.sleep(0.01)
+        time.sleep(0.5)
+
+        if not self.uf850.retract_servo_z_closed_loop(0.03, speed_mps=0.03):
+            print("⚠️ Servo retract failed. Trying planned retract...")
+            if not self.uf850.retract_relative_z(0.03):
+                print("⚠️ Planned retract also failed, proceeding to drop anyway...")
         self.wait_for_settled(self.uf850)
 
-        # --- STEP 5: DROP-OFF ---
+        # --- STEP 9: HOME FIRST (reset arm config for reliable planning) ---
+        print("🏠 Homing UF850 first (clears cramped config)...")
+        if not self.uf850.move_to_joint_positions(self.UF_HOME_JOINTS, velocity=0.1):
+            print("⚠️ Home failed, trying drop directly...")
+        else:
+            self.wait_for_settled(self.uf850)
+
+        # --- STEP 10: DROP-OFF ---
         print("🗑️ Moving to Drop Pose...")
-        if not self.uf850.move_to_pose_robust(self.DROP_POSE['x'], self.DROP_POSE['y'], self.DROP_POSE['z'], velocity=0.1): return False
+        drop_ok = self.uf850.move_to_pose_robust(
+            self.DROP_POSE['x'], self.DROP_POSE['y'], self.DROP_POSE['z'], velocity=0.1)
+        
+        if not drop_ok:
+            print("⚠️ IK failed for drop zone. Trying Cartesian path...")
+            drop_ok = self.uf850.move_cartesian_to_pose(
+                self.DROP_POSE['x'], self.DROP_POSE['y'], self.DROP_POSE['z'], velocity=0.1)
+        
+        if not drop_ok:
+            print("❌ Cannot reach drop zone. Releasing gripper and homing for retry...")
+            self.gripper.move_to_joint_positions({"rg6_l_out": math.radians(self.OPEN_DEG)})
+            time.sleep(1.0)
+            self.hold_status_pub.publish(Bool(data=False))
+            self.uf850.move_to_joint_positions(self.UF_HOME_JOINTS)
+            self.wait_for_settled(self.uf850)
+            return False
+
         self.wait_for_settled(self.uf850)
 
-        print("🎉 Finalizing: Release & Home...")
+        # --- STEP 10: RELEASE & HOME ---
+        print("📦 Opening gripper to release...")
         if not self.gripper.move_to_joint_positions({"rg6_l_out": math.radians(self.OPEN_DEG)}): return False
-        time.sleep(1.0); self.hold_status_pub.publish(Bool(data=False))
+        time.sleep(1.0)
+        self.hold_status_pub.publish(Bool(data=False))
         
-        if not self.uf850.move_to_joint_positions(self.UF_HOME_JOINTS): return False
+        print("🏠 Homing UF850...")
+        if not self.uf850.move_to_joint_positions(self.UF_HOME_JOINTS, velocity=0.1): return False
+        self.wait_for_settled(self.uf850)
         
-        print("✅ [SUCCESS] Sequence Complete.")
+        print("✅ [SUCCESS] Pickup Sequence Complete.")
         return True
 
 def main(args=None):

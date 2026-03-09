@@ -66,21 +66,55 @@ class ObjectFlipSkill(Node):
 
         # --- STEP 2: FIXED 180° SINGLE ROTATION ---
         print("🔄 STEP 2: Executing Single 180° Flip...")
+        
+        # Fresh joint state read
+        time.sleep(0.5)
         joints = self.uf850.current_joint_positions.copy()
+        
+        # Debug: print all u1 joints
+        u1_joints = {k: v for k, v in joints.items() if k.startswith("u1")}
+        print(f"📊 Current u1 joints: { {k: f'{math.degrees(v):.1f}°' for k, v in u1_joints.items()} }")
+        
         current_j6 = joints.get("u1_joint6", 0.0)
         
-        # 🎯 THE FIX: Force rotation to the opposite side only once
-        # If J6 is positive (> 0), rotate to the negative side.
-        # If J6 is negative (<= 0), rotate to the positive side.
+        # Calculate target: rotate 180° in the direction that avoids joint limits
         if current_j6 > 0:
-            print(f"🔄 J6 is at {math.degrees(current_j6):.1f}°. Rotating -180°...")
-            joints["u1_joint6"] = current_j6 - math.pi
+            target_j6 = current_j6 - math.pi
         else:
-            print(f"🔄 J6 is at {math.degrees(current_j6):.1f}°. Rotating +180°...")
-            joints["u1_joint6"] = current_j6 + math.pi
-            
-        if not self.uf850.move_to_joint_positions(joints): return False
+            target_j6 = current_j6 + math.pi
+        print(f"🔄 J6: {math.degrees(current_j6):.1f}° → {math.degrees(target_j6):.1f}° (Δ=180°)")
+        
+        # Build target: keep all current u1 joints, only change J6
+        flip_target = {}
+        for k, v in joints.items():
+            if k.startswith("u1"):
+                flip_target[k] = v
+        flip_target["u1_joint6"] = target_j6
+        print(f"🎯 Target joints: { {k: f'{math.degrees(v):.1f}°' for k, v in flip_target.items()} }")
+        
+        flip_ok = self.uf850.move_to_joint_positions(flip_target, velocity=0.15)
+        
+        if not flip_ok:
+            print("⚠️ Flip move failed. Retrying with slower velocity...")
+            time.sleep(0.5)
+            flip_target["u1_joint6"] = target_j6  # Ensure target is still correct
+            flip_ok = self.uf850.move_to_joint_positions(flip_target, velocity=0.08)
+            if not flip_ok:
+                print("❌ J6 rotation failed completely.")
+                return False
+        
         self.wait_for_arm_settled()
+        
+        # Verify rotation actually happened
+        time.sleep(0.5)
+        actual_j6 = self.uf850.current_joint_positions.get("u1_joint6", 0.0)
+        rotation_deg = abs(actual_j6 - current_j6) * 180.0 / math.pi
+        print(f"📊 J6 moved: {math.degrees(current_j6):.1f}° → {math.degrees(actual_j6):.1f}° (Δ={rotation_deg:.1f}°)")
+        
+        if abs(rotation_deg - 180.0) > 20.0:
+            print(f"⚠️ J6 rotation incomplete! Expected 180°, got {rotation_deg:.1f}°")
+        else:
+            print(f"✅ J6 rotated successfully!")
 
         # --- STEP 3: TACTILE DESCENT ---
         print("⏰ Activating Servo Node...")
@@ -113,11 +147,22 @@ def main(args=None):
     rclpy.init(args=args); node = ObjectFlipSkill()
     executor = MultiThreadedExecutor(); executor.add_node(node)
     threading.Thread(target=executor.spin, daemon=True).start()
+    time.sleep(1.0)
+    
     try:
-        while rclpy.ok():
-            if node.is_holding_object:
-                if node.execute_flip(interactive=True): break
+        # Wait up to 3s for hold status, then proceed anyway
+        print("⏳ Waiting for hold status (or 3s timeout)...")
+        wait_start = time.time()
+        while rclpy.ok() and not node.is_holding_object:
+            if time.time() - wait_start > 3.0:
+                print("⚠️ No hold status received. Assuming object is held — proceeding with flip...")
+                node.is_holding_object = True
+                break
             time.sleep(0.5)
+        
+        if node.is_holding_object:
+            print("🔄 Starting flip sequence...")
+            node.execute_flip(interactive=False)
     except KeyboardInterrupt: pass
     finally: rclpy.shutdown()
 

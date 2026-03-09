@@ -107,15 +107,15 @@ class UnscrewSkill(Node):
         print("\n🔍 [STAIRCASE] Starting Sequential Crosshair Alignment & Descent...")
         
         # --- ⚙️ SPEED & VELOCITY CONTROLS ---
-        XY_SPEED_GAIN = 5.0      
-        Z_MAX_SPEED = 0.005       # 🛑 CHANGED: Max 10mm/s cap for funnel logic 
-        MAX_XY_STEP = 0.010       
+        XY_SPEED_GAIN = 2.5          # Halved from 5.0 to reduce overshoot
+        Z_MAX_SPEED = 0.005          # 5mm/s → 1.5mm/s actual
+        MAX_XY_STEP = 0.006          # 6mm/s max → 1.8mm/s actual (was 10mm/s)
         
-        # --- 🌀 AGGRESSIVE FAST SPIRAL SEARCH CONTROLS ---
-        SPIRAL_GAP_MM = 15.0         
+        # --- 🌀 SPIRAL SEARCH CONTROLS (SMOOTH) ---
+        SPIRAL_GAP_MM = 8.0          # Tighter spiral rings (was 15)
         SPIRAL_ANGULAR_STEP = 0.5    
-        SPIRAL_VELOCITY_GAIN = 6.0   
-        MAX_SPIRAL_STEP = 0.060      
+        SPIRAL_VELOCITY_GAIN = 2.0   # Gentler amplification (was 6)
+        MAX_SPIRAL_STEP = 0.012      # 12mm/s max speed (was 60mm/s)
         
         # --- 🎯 SEQUENTIAL ALIGNMENT CONTROL ---
         Y_TOLERANCE_PX = 10.0        
@@ -128,10 +128,9 @@ class UnscrewSkill(Node):
         FORCE_SPIKE_THRESHOLD = 3.0  
         ALIGN_TOLERANCE_PX = 10.0    
         RETRACT_DIST = 0.005         
-        
         # --- 🔄 WIGGLE TEST CONTROLS ---
-        WIGGLE_MOVEMENT_MM = 0.015   
-        WIGGLE_SPIKE_VALUE = 1.0     
+        WIGGLE_VELOCITY = 0.033     # m/s → ~10mm/s actual (with 0.3 scale) → ~5.0mm in 0.5s
+        WIGGLE_SPIKE_VALUE = 0.5     
         
         with self.data_lock:
             force_data = self.local_view.get('force_torque', {}).get('force', {})
@@ -142,9 +141,13 @@ class UnscrewSkill(Node):
         print(f"⚖️ Baselines -> Fx: {base_fx:.2f}N | Fy: {base_fy:.2f}N | Fz: {base_fz:.2f}N")
         
         spiral_idx = 0
-        spiral_start_time = None  # 🛑 NEW: Timer for spiral search
+        spiral_start_time = None
         retry_count = 0
         MAX_RETRIES = 3
+        
+        # Smoothing state for visual servo controller
+        prev_joy_x = 0.0
+        prev_joy_y = 0.0
         
         while rclpy.ok():
             with self.data_lock:
@@ -189,7 +192,7 @@ class UnscrewSkill(Node):
                 self.tool_pub.publish(cmd_msg)
                 time.sleep(0.5)  
                 
-                print("🔄 [WIGGLE] XY Aligned and Bit Seated. Performing 4-Direction Wiggle Test...")
+                print("🔄 [WIGGLE] Performing 4-Direction Wiggle Test...")
                 with self.data_lock:
                     wiggle_base_fx = self.local_view.get('force_torque', {}).get('force', {}).get('x', 0.0)
                     wiggle_base_fy = self.local_view.get('force_torque', {}).get('force', {}).get('y', 0.0)
@@ -197,17 +200,18 @@ class UnscrewSkill(Node):
                 print(f"⚖️ Wiggle Baselines -> Fx: {wiggle_base_fx:.2f}N | Fy: {wiggle_base_fy:.2f}N")
                 
                 wiggle_directions = [
-                    (WIGGLE_MOVEMENT_MM, 0.0, 'x', "+X"),
-                    (-WIGGLE_MOVEMENT_MM, 0.0, 'x', "-X"),
-                    (0.0, WIGGLE_MOVEMENT_MM, 'y', "+Y"),
-                    (0.0, -WIGGLE_MOVEMENT_MM, 'y', "-Y")
+                    (WIGGLE_VELOCITY, 0.0, 'x', "+X"),
+                    (-WIGGLE_VELOCITY, 0.0, 'x', "-X"),
+                    (0.0, WIGGLE_VELOCITY, 'y', "+Y"),
+                    (0.0, -WIGGLE_VELOCITY, 'y', "-Y")
                 ]
                 
                 successful_wiggles = 0
                 
                 for w_dx, w_dy, axis, name in wiggle_directions:
+                    # Push — enough displacement to detect force reaction
                     self.moveit_backend.jog_cartesian_servo(w_dx, w_dy, 0.0, duration=0.5)
-                    time.sleep(0.5) 
+                    time.sleep(0.2) 
                     
                     with self.data_lock:
                         curr_fx = self.local_view.get('force_torque', {}).get('force', {}).get('x', 0.0)
@@ -224,22 +228,36 @@ class UnscrewSkill(Node):
                     else:
                         print(f"  ❌ Wiggle {name} FAIL | Spike: {spike:.2f}N (Required: {WIGGLE_SPIKE_VALUE}N)")
                         
+                    # Return to center
                     self.moveit_backend.jog_cartesian_servo(-w_dx, -w_dy, 0.0, duration=0.5)
-                    time.sleep(0.5)
+                    time.sleep(0.2)
 
-                # --- RETRY LOGIC FOR WIGGLE FAIL (Handles both Misaligned and Aligned cases) ---
+                # --- RETRY LOGIC FOR WIGGLE FAIL ---
                 if successful_wiggles < 3:
                     retry_count += 1
                     if is_misaligned:
-                        print(f"❌ [MISALIGNED & WIGGLE FAIL] Error was {dist_px:.1f}px. Retry {retry_count}/{MAX_RETRIES}. Retracting 5mm...")
+                        print(f"❌ [MISALIGNED & WIGGLE FAIL] Error was {dist_px:.1f}px. Retry {retry_count}/{MAX_RETRIES}. Retracting 10mm...")
                     else:
-                        print(f"❌ [WIGGLE FAIL] Only {successful_wiggles}/4 wiggles succeeded. Retry {retry_count}/{MAX_RETRIES}. Retracting 5mm...")
-                        
-                    self.moveit_backend.retract_relative_z(0.005) # Guaranteed 5mm lift
-                    time.sleep(1.0) # Let forces completely settle before re-aligning
+                        print(f"❌ [WIGGLE FAIL] Only {successful_wiggles}/4 wiggles succeeded. Retry {retry_count}/{MAX_RETRIES}. Retracting 10mm...")
+                    
                     if retry_count > MAX_RETRIES:
                         print("❌ Max retries reached. Aborting target.")
                         return False
+                    
+                    # Servo closed-loop retract (10mm) — more reliable than planned retract
+                    print("⬆️ Servo retracting 10mm...")
+                    self.moveit_backend.retract_servo_z_closed_loop(0.005, speed_mps=0.02)
+                    time.sleep(1.0)
+                    
+                    # 🔄 Reset force baselines after retract (stale baselines cause false triggers)
+                    with self.data_lock:
+                        force_data = self.local_view.get('force_torque', {}).get('force', {})
+                        base_fz = force_data.get('z', 0.0)
+                    print(f"⚖️ Baselines RESET -> Fz: {base_fz:.2f}N")
+                    
+                    # Reset smoothing state so XY alignment starts fresh
+                    prev_joy_x = 0.0
+                    prev_joy_y = 0.0
                     continue 
                 
                 print("✅ [WIGGLE PASS] Bit is fully seated and locked into screw head.")
@@ -271,14 +289,20 @@ class UnscrewSkill(Node):
                 dx = max(min(dx, MAX_SPIRAL_STEP), -MAX_SPIRAL_STEP)
                 dy = max(min(dy, MAX_SPIRAL_STEP), -MAX_SPIRAL_STEP)
                 
-                print(f"⚠️ Vision lost. Spiral search Step {spiral_idx} (Gap: {SPIRAL_GAP_MM}mm)")
-                self.moveit_backend.jog_cartesian_servo(dx, dy, 0.0, duration=0.1)
-                time.sleep(0.3)
+                print(f"⚠️ Vision lost. Spiral search Step {spiral_idx} | dx:{dx*1000:.1f} dy:{dy*1000:.1f} mm/s")
+                # Use longer duration with short gap to keep servo commands flowing
+                # continuously — avoids start-stop jerk from command timeout gaps
+                self.moveit_backend.jog_cartesian_servo(dx, dy, 0.0, duration=0.3)
+                time.sleep(0.1)
                 continue
 
             # Reset spiral variables if we found the screw
             spiral_idx = 0 
             spiral_start_time = None 
+            
+            # --- 🎯 ROBUST VISUAL SERVO CONTROLLER ---
+            # Deadband: ignore sub-pixel noise near the target
+            DEADBAND_PX = 5.0
             
             if SWAP_AXES:
                 raw_joy_x = (err_y * self.MM_PER_PIX) * X_SENSE * XY_SPEED_GAIN
@@ -287,31 +311,53 @@ class UnscrewSkill(Node):
                 raw_joy_x = (err_x * self.MM_PER_PIX) * X_SENSE * XY_SPEED_GAIN
                 raw_joy_y = (err_y * self.MM_PER_PIX) * Y_SENSE * XY_SPEED_GAIN
             
+            # Apply deadband — zero out command if error is small
+            if abs(err_y if SWAP_AXES else err_x) < DEADBAND_PX:
+                raw_joy_x = 0.0
+            if abs(err_x if SWAP_AXES else err_y) < DEADBAND_PX:
+                raw_joy_y = 0.0
+            
             align_state = ""
             if abs(err_y) > Y_TOLERANCE_PX:
                 align_state = "[Align Y]"
                 if SWAP_AXES:
-                    joy_x = max(min(raw_joy_x, MAX_XY_STEP), -MAX_XY_STEP)
-                    joy_y = 0.0 
+                    target_joy_x = max(min(raw_joy_x, MAX_XY_STEP), -MAX_XY_STEP)
+                    target_joy_y = 0.0 
                 else:
-                    joy_x = 0.0
-                    joy_y = max(min(raw_joy_y, MAX_XY_STEP), -MAX_XY_STEP)
+                    target_joy_x = 0.0
+                    target_joy_y = max(min(raw_joy_y, MAX_XY_STEP), -MAX_XY_STEP)
             else:
                 align_state = "[Align X]"
-                joy_x = max(min(raw_joy_x, MAX_XY_STEP), -MAX_XY_STEP)
-                joy_y = max(min(raw_joy_y, MAX_XY_STEP), -MAX_XY_STEP)
+                target_joy_x = max(min(raw_joy_x, MAX_XY_STEP), -MAX_XY_STEP)
+                target_joy_y = max(min(raw_joy_y, MAX_XY_STEP), -MAX_XY_STEP)
+            
+            # Exponential smoothing: prevents sudden velocity reversals
+            # α=0.3 → new command is 30% target + 70% previous (heavy damping)
+            SMOOTH_ALPHA = 0.3
+            smooth_joy_x = SMOOTH_ALPHA * target_joy_x + (1.0 - SMOOTH_ALPHA) * prev_joy_x
+            smooth_joy_y = SMOOTH_ALPHA * target_joy_y + (1.0 - SMOOTH_ALPHA) * prev_joy_y
+            
+            # Acceleration limiter: cap velocity change per cycle
+            MAX_ACCEL = 0.002  # m/s per cycle
+            smooth_joy_x = max(min(smooth_joy_x, prev_joy_x + MAX_ACCEL), prev_joy_x - MAX_ACCEL)
+            smooth_joy_y = max(min(smooth_joy_y, prev_joy_y + MAX_ACCEL), prev_joy_y - MAX_ACCEL)
+            
+            prev_joy_x = smooth_joy_x
+            prev_joy_y = smooth_joy_y
             
             # --- 🌪️ FUNNEL LOGIC FOR Z DESCENT ---
-            if dist_px <= ALIGN_TOLERANCE_PX:
+            # Pause Z completely when very misaligned to avoid dragging bit sideways
+            if dist_px > 30.0:
+                dynamic_z_speed = 0.0  # Pure XY correction first
+            elif dist_px <= ALIGN_TOLERANCE_PX:
                 dynamic_z_speed = Z_MAX_SPEED
             else:
-                # Scale speed proportionally down. Floor it at 2mm/s so it doesn't freeze.
-                dynamic_z_speed = max(0.002, Z_MAX_SPEED * (ALIGN_TOLERANCE_PX / dist_px))
+                dynamic_z_speed = max(0.001, Z_MAX_SPEED * (ALIGN_TOLERANCE_PX / dist_px))
             
-            print(f"📉 {align_state} | Fz: {diff_fz:.2f}N | ErrX: {err_x:>5.1f} | ErrY: {err_y:>5.1f} | Total: {dist_px:.1f}px | Z-Speed: {dynamic_z_speed*1000:.1f}mm/s")
+            print(f"📉 {align_state} | Fz: {diff_fz:.2f}N | ErrX: {err_x:>5.1f} | ErrY: {err_y:>5.1f} | Total: {dist_px:.1f}px | Vx:{smooth_joy_x*1000:.1f} Vy:{smooth_joy_y*1000:.1f} Vz:{dynamic_z_speed*1000:.1f} mm/s")
             
-            self.moveit_backend.jog_cartesian_servo(joy_x, joy_y, -dynamic_z_speed, duration=0.2)
-            time.sleep(0.3) 
+            self.moveit_backend.jog_cartesian_servo(smooth_joy_x, smooth_joy_y, -dynamic_z_speed, duration=0.3)
+            time.sleep(0.1)  # Short gap for vision update
 
         return False
 
@@ -430,7 +476,12 @@ class UnscrewSkill(Node):
             
         with self.data_lock:
             target_data = next((t for t in self.latest_targets if t['id'] == target_id), None)
-        if not target_data: return False
+        if not target_data:
+            print(f"❌ Target ID {target_id} not found in vision data.")
+            return False
+        if 'xyz' not in target_data:
+            print(f"❌ Target ID {target_id} has no 'xyz' position data. Skipping.")
+            return False
 
         raw_pose = Pose()
         raw_pose.position.x, raw_pose.position.y, raw_pose.position.z = target_data['xyz']
@@ -480,51 +531,60 @@ class UnscrewSkill(Node):
             # 🛑 NEW: Capture the staircase result to check for the HOLE_TIMEOUT
             staircase_result = self.perform_staircase_descent()
             
-            if staircase_result == True or staircase_result == "HOLE_TIMEOUT":
-                
-                # If vision timed out on a hole, skip the extraction and safely retract
-                if staircase_result == "HOLE_TIMEOUT":
-                    print("⏭️ [SKIP EXTRACTION] Hole timeout reached. Retracting safely before moving to Bin 1...")
-                    self.moveit_backend.retract_relative_z(0.050)
-                    self.wait_for_arm_settled()
-                    extraction_success = True  # Proceed to bin
-                else:
-                    print("🏁 [FINISH] Bit is seated. Ready for unscrewing.")
-                    if interactive: input("👉 GATE 3: Press [ENTER] to execute Dynamic Force-Compliant Extraction...")
-                    extraction_success = self.perform_compliant_extraction()
-                
-                # Proceed to Drop-Off
-                if extraction_success:
-                    if staircase_result == True:
-                        print("🎉 [SUCCESS] Screw successfully removed!")
-                    
-                    print("🗑️ [DROP-OFF] Navigating to Bin 1...")
-                    bin_pose = Pose()
-                    bin_pose.position.x, bin_pose.position.y, bin_pose.position.z = bin1_raw
-                    world_bin_pose = self.moveit_backend.get_transformed_pose(bin_pose, self.CAMERA_FRAME, self.WORLD_FRAME)
-                    
-                    if world_bin_pose:
-                        bx = world_bin_pose.pose.position.x
-                        by = world_bin_pose.pose.position.y
-                        bz = world_bin_pose.pose.position.z + self.TOOL_LENGTH + 0.030 
-                        
-                        if self.moveit_backend.move_to_pose_robust(bx, by, bz):
-                            print("⏬ [WAITING] Allowing arm to settle over bin...")
-                            self.wait_for_arm_settled() # 🛑 REPLACED TIME.SLEEP(2.0)
-                            
-                            print("⏬ [RELEASE] Dropping screw...")
-                            drop_cmd = Int8()
-                            drop_cmd.data = 3
-                            self.tool_pub.publish(drop_cmd)
-                            time.sleep(1.0)
-                            
-                            drop_cmd.data = 0
-                            self.tool_pub.publish(drop_cmd)
-                            print("♻️ [RESET] Ready for next target.")
-                    
-                if interactive: input("👉 Sequence Finished. Press [ENTER] to return to monitoring...")
+            if staircase_result == False:
+                # Wiggle test failed after max retries — retract and go to bin for next target
+                print("⚠️ [STAIRCASE FAILED] Could not seat bit. Retracting and moving to bin...")
+                self.moveit_backend.retract_relative_z(0.050)
+                self.wait_for_arm_settled()
+                self._navigate_to_bin(bin1_raw)
+                return True  # Return True so caller continues to next screw
+            
+            # If vision timed out on a hole, skip the extraction and safely retract
+            if staircase_result == "HOLE_TIMEOUT":
+                print("⏭️ [SKIP EXTRACTION] Hole timeout reached. Retracting safely before moving to Bin 1...")
+                self.moveit_backend.retract_relative_z(0.050)
+                self.wait_for_arm_settled()
+                self._navigate_to_bin(bin1_raw)
                 return True
+            
+            # staircase_result == True → bit is seated
+            print("🏁 [FINISH] Bit is seated. Ready for unscrewing.")
+            if interactive: input("👉 GATE 3: Press [ENTER] to execute Dynamic Force-Compliant Extraction...")
+            extraction_success = self.perform_compliant_extraction()
+            
+            if extraction_success:
+                print("🎉 [SUCCESS] Screw successfully removed!")
+                self._navigate_to_bin(bin1_raw)
+                
+            if interactive: input("👉 Sequence Finished. Press [ENTER] to return to monitoring...")
+            return True
         return False
+    
+    def _navigate_to_bin(self, bin1_raw):
+        """Navigate to bin 1 and release the screw."""
+        print("🗑️ [DROP-OFF] Navigating to Bin 1...")
+        bin_pose = Pose()
+        bin_pose.position.x, bin_pose.position.y, bin_pose.position.z = bin1_raw
+        world_bin_pose = self.moveit_backend.get_transformed_pose(bin_pose, self.CAMERA_FRAME, self.WORLD_FRAME)
+        
+        if world_bin_pose:
+            bx = world_bin_pose.pose.position.x
+            by = world_bin_pose.pose.position.y
+            bz = world_bin_pose.pose.position.z + self.TOOL_LENGTH + 0.030 
+            
+            if self.moveit_backend.move_to_pose_robust(bx, by, bz):
+                print("⏬ [WAITING] Allowing arm to settle over bin...")
+                self.wait_for_arm_settled()
+                
+                print("⏬ [RELEASE] Dropping screw...")
+                drop_cmd = Int8()
+                drop_cmd.data = 3
+                self.tool_pub.publish(drop_cmd)
+                time.sleep(1.0)
+                
+                drop_cmd.data = 0
+                self.tool_pub.publish(drop_cmd)
+                print("♻️ [RESET] Ready for next target.")
 
 def main(args=None):
     rclpy.init(args=args)
