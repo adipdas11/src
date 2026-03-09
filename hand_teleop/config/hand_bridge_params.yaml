@@ -1,0 +1,38 @@
+hand_robot_bridge:
+  ros__parameters:
+    # Position mode scaling
+    linear_scale: 1.2         # Gain after quadratic curve
+    max_linear_vel: 0.15      # Per-axis velocity clamp (m/s)
+    control_radius: 0.25      # Distance from center (normalized) for max speed
+    depth_multiplier: 3.0     # Amplify hand-scale delta (depth proxy)
+
+    # Filtering
+    deadzone: 0.03            # Normalized displacement deadzone
+    smoothing_alpha: 0.12     # Exponential filter
+
+    # Timing
+    publish_rate: 50.0        # Hz (matches servo publish_period)
+    halt_cycles: 4            # Zero-twist cycles after fist release
+
+    # Linear axis mapping: camera [X, Y, Z] -> robot twist axis
+    axis_map_x: '-y'
+    axis_map_y: '-z'
+    axis_map_z: 'x'
+
+    # Orientation mode (UF850 only, toggled by left pinch)
+    angular_scale: 1.5        # Angular velocity gain
+    max_angular_vel: 0.5      # Per-axis clamp (rad/s)
+    angular_deadzone: 0.05    # Ignore small angular jitter (rad/s)
+    angular_alpha: 0.2        # Smoothing factor for angular vel
+    # Angular axis mapping: hand [X, Y, Z] angular -> robot angular axis
+    axis_map_ang_x: 'z'
+    axis_map_ang_y: '-x'
+    axis_map_ang_z: 'y'
+
+    # Gripper (toggled by right pinch)
+    enable_gripper: true
+    gripper_open_pos: 0.6     # rg6_l_out open (rad)
+    gripper_close_pos: -0.6   # rg6_l_out closed (rad)
+
+    # Calibration
+    auto_center: true         # Auto-set center on first fist

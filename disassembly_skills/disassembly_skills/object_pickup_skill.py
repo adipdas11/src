@@ -116,7 +116,8 @@ class PickupSkill(Node):
             req_f = self.uf_servo_start_client.call_async(Trigger.Request())
             while rclpy.ok() and not req_f.done(): time.sleep(0.01)
         else: return False
-            
+        time.sleep(1.0)  # Allow controller transition to complete
+
         if not self.uf850.retract_servo_z_closed_loop(-self.HOVER_HEIGHT, speed_mps=self.DESCENT_SPEED): return False
         self.wait_for_settled(self.uf850)
 

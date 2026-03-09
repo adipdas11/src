@@ -193,12 +193,16 @@ class ObjectHoldSkill(Node):
             return False
         self.wait_for_arm_settled() 
         
-        time.sleep(0.5)
+        # Re-activate servo (times out during settle, position controller takes over)
+        print("⏰ Re-activating Servo for retract...")
+        if self.uf_servo_start_client.wait_for_service(timeout_sec=2.0):
+            req_f = self.uf_servo_start_client.call_async(Trigger.Request())
+            while rclpy.ok() and not req_f.done(): time.sleep(0.01)
+        time.sleep(1.0)  # Allow controller transition to complete
 
-        # --- STEP 3: CLOSED-LOOP RETRACT (10mm) ---
-        if interactive: input("🚀 STEP 3: Retract 10mm? [Enter]")
-        # Retract exactly 0.01m (10mm) straight upward
-        if not self.uf850.retract_servo_z_closed_loop(0.005): 
+        # --- STEP 3: CLOSED-LOOP RETRACT (5mm) ---
+        if interactive: input("🚀 STEP 3: Retract 5mm? [Enter]")
+        if not self.uf850.retract_servo_z_closed_loop(0.005):
             print("❌ [ERROR] Failed to retract 10mm. Aborting.")
             return False
         self.wait_for_arm_settled()

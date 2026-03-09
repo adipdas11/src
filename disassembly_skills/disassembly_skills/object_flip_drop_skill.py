@@ -121,7 +121,8 @@ class FlipDropSkill(Node):
         if self.uf_servo_start_client.wait_for_service(timeout_sec=5.0):
             req_f = self.uf_servo_start_client.call_async(Trigger.Request())
             while rclpy.ok() and not req_f.done(): time.sleep(0.01)
-            
+        time.sleep(1.0)  # Allow controller transition to complete
+
         if not self.uf850.move_linear_z_with_torque_stop(self.DESCENT_SPEED, self.TORQUE_THRESHOLD): return False
         self.wait_for_arm_settled()
         self.uf850.jog_cartesian_servo(0.0, 0.0, 0.005, duration=0.5)

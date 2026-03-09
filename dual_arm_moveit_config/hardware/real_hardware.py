@@ -50,7 +50,7 @@ class RG:
 class RealRobotInterface:
     def __init__(self, ip, name, dof, logger, has_linear_track=False):
         self.ip=ip; self.name=name; self.dof=dof; self.logger=logger; self.has_linear_track=has_linear_track
-        self.arm = XArmAPI(self.ip); self.connected=False
+        self.arm = XArmAPI(self.ip, report_type='real'); self.connected=False
         
         self.prev_pos = [0.0] * self.dof
         self.prev_time = time.time()
@@ -201,29 +201,29 @@ class RealHardware(Node):
             # 🛑 MANUAL MAPPING TO MATCH YOUR TOPIC ECHO ORDER
             # The order here must match exactly what you see in 'ros2 topic echo'
             mapping = [
-                ('xarm5_joint1', x_p[0], x_e[0]),
-                ('xarm5_joint2', x_p[1], x_e[1]),
-                ('slider_slider_joint', s_pos, 0.0),
-                ('xarm5_joint5', x_p[4], x_e[4]),
-                ('xarm5_joint3', x_p[2], x_e[2]),
-                ('u1_joint1',    u_p[0], u_e[0]),
-                ('u1_joint2',    u_p[1], u_e[1]),
-                ('u1_joint3',    u_p[2], u_e[2]),
-                ('xarm5_joint4', x_p[3], x_e[3]),
-                ('u1_joint4',    u_p[3], u_e[3]),
-                ('u1_joint5',    u_p[4], u_e[4]),
-                ('u1_joint6',    u_p[5], u_e[5]),
-                ('rg6_l_out',    g_pos, 0.0)
+                ('xarm5_joint1', x_p[0], x_v[0], x_e[0]),
+                ('xarm5_joint2', x_p[1], x_v[1], x_e[1]),
+                ('slider_slider_joint', s_pos, 0.0, 0.0),
+                ('xarm5_joint5', x_p[4], x_v[4], x_e[4]),
+                ('xarm5_joint3', x_p[2], x_v[2], x_e[2]),
+                ('u1_joint1',    u_p[0], u_v[0], u_e[0]),
+                ('u1_joint2',    u_p[1], u_v[1], u_e[1]),
+                ('u1_joint3',    u_p[2], u_v[2], u_e[2]),
+                ('xarm5_joint4', x_p[3], x_v[3], x_e[3]),
+                ('u1_joint4',    u_p[3], u_v[3], u_e[3]),
+                ('u1_joint5',    u_p[4], u_v[4], u_e[4]),
+                ('u1_joint6',    u_p[5], u_v[5], u_e[5]),
+                ('rg6_l_out',    g_pos, 0.0, 0.0)
             ]
 
             msg.name = [m[0] for m in mapping]
             msg.position = [float(m[1]) for m in mapping]
-            msg.velocity = [0.0] * len(mapping)
+            msg.velocity = [float(m[2]) for m in mapping]
 
             # 🛡️ THE FINAL ROUNDING FILTER (FORCED)
             clean_efforts = []
             for m in mapping:
-                raw_val = float(m[2])
+                raw_val = float(m[3])
                 # Hard Deadband
                 if abs(raw_val) < 0.15:
                     clean_efforts.append(0.0)

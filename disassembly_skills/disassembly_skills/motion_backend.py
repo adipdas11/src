@@ -4,13 +4,18 @@ from rclpy.node import Node
 from rclpy.action import ActionClient
 from moveit_msgs.action import MoveGroup, ExecuteTrajectory
 from moveit_msgs.msg import Constraints, JointConstraint, RobotState
-from moveit_msgs.srv import GetPositionIK
+from moveit_msgs.srv import GetPositionIK, GetCartesianPath
 from geometry_msgs.msg import PoseStamped, Quaternion, Pose, TwistStamped
 from sensor_msgs.msg import JointState
 import tf2_ros
 from tf2_ros import Buffer, TransformListener
 import tf2_geometry_msgs 
 import threading, math, time, os, subprocess
+try:
+    from controller_manager_msgs.srv import SwitchController
+    _HAS_SWITCH_CTRL = True
+except ImportError:
+    _HAS_SWITCH_CTRL = False
 
 class MotionBackend:
     def __init__(self, node: Node, group_name: str):
@@ -33,6 +38,7 @@ class MotionBackend:
         self._action_client = ActionClient(self.node, MoveGroup, 'move_action')
         self._execute_client = ActionClient(self.node, ExecuteTrajectory, 'execute_trajectory')
         self._ik_client = self.node.create_client(GetPositionIK, 'compute_ik')
+        self._cartesian_client = self.node.create_client(GetCartesianPath, 'compute_cartesian_path')
         
         # --- MoveIt Servo Publisher ---
         self.servo_pub = self.node.create_publisher(TwistStamped, f'/{self.prefix}_servo_node/delta_twist_cmds', 10)
@@ -48,6 +54,14 @@ class MotionBackend:
         self.joint_sub = self.node.create_subscription(JointState, '/joint_states', self._joint_state_callback, 10)
         
         self.is_activated = False
+
+        # --- Controller Mode Tracking ---
+        self._in_servo_mode = False
+        if _HAS_SWITCH_CTRL:
+            self._switch_ctrl_client = self.node.create_client(
+                SwitchController, '/controller_manager/switch_controller')
+        else:
+            self._switch_ctrl_client = None
 
     def _joint_state_callback(self, msg):
         for i, name in enumerate(msg.name):
@@ -84,8 +98,78 @@ class MotionBackend:
         self.servo_pub.publish(TwistStamped())
         self.node.get_logger().error("🛑 MOTION STOPPED")
 
+    # --- Controller Mode Switching ---
+    def _ensure_servo_mode(self):
+        """Deactivate trajectory controller so servo commands don't fight it."""
+        if self._in_servo_mode:
+            return True
+        if not self._switch_ctrl_client:
+            self._in_servo_mode = True
+            return True
+        if not self._switch_ctrl_client.wait_for_service(timeout_sec=2.0):
+            self.node.get_logger().warn("⚠️ Controller manager not available — skipping switch.")
+            self._in_servo_mode = True
+            return True
+
+        req = SwitchController.Request()
+        req.deactivate_controllers = [self.controller_name]
+        req.strictness = SwitchController.Request.BEST_EFFORT
+        req.activate_asap = True
+
+        future = self._switch_ctrl_client.call_async(req)
+        t0 = time.time()
+        while not future.done():
+            if time.time() - t0 > 5.0:
+                self.node.get_logger().error("❌ Controller switch timeout.")
+                return False
+            time.sleep(0.01)
+
+        ok = future.result().ok
+        if ok:
+            self.node.get_logger().info(f"🔄 Deactivated {self.controller_name} → servo mode.")
+            self._in_servo_mode = True
+            time.sleep(0.3)  # Brief settle for controller transition
+        else:
+            self.node.get_logger().warn(f"⚠️ Failed to deactivate {self.controller_name}.")
+        return ok
+
+    def _ensure_trajectory_mode(self):
+        """Re-activate trajectory controller for MoveGroup / planned motions."""
+        if not self._in_servo_mode:
+            return True
+        if not self._switch_ctrl_client:
+            self._in_servo_mode = False
+            return True
+        if not self._switch_ctrl_client.wait_for_service(timeout_sec=2.0):
+            self.node.get_logger().warn("⚠️ Controller manager not available — skipping switch.")
+            self._in_servo_mode = False
+            return True
+
+        req = SwitchController.Request()
+        req.activate_controllers = [self.controller_name]
+        req.strictness = SwitchController.Request.BEST_EFFORT
+        req.activate_asap = True
+
+        future = self._switch_ctrl_client.call_async(req)
+        t0 = time.time()
+        while not future.done():
+            if time.time() - t0 > 5.0:
+                self.node.get_logger().error("❌ Controller switch timeout.")
+                return False
+            time.sleep(0.01)
+
+        ok = future.result().ok
+        if ok:
+            self.node.get_logger().info(f"🔄 Re-activated {self.controller_name} → trajectory mode.")
+            self._in_servo_mode = False
+            time.sleep(0.3)  # Brief settle for controller transition
+        else:
+            self.node.get_logger().warn(f"⚠️ Failed to re-activate {self.controller_name}.")
+        return ok
+
     # --- Core Motion Logic ---
     def move_to_pose_robust(self, x, y, z, q_dict=None, velocity=0.1, frame_id='world_world'):
+        self._ensure_trajectory_mode()
         req = GetPositionIK.Request()
         req.ik_request.group_name = self.group_name
         req.ik_request.avoid_collisions = True
@@ -113,7 +197,8 @@ class MotionBackend:
         # Primary Attempt
         ik_res = self._call_ik_sync(req)
         if ik_res.error_code.val == 1:
-            self._execute_joint_goal(ik_res.solution.joint_state, velocity)
+            if not self._execute_joint_goal(ik_res.solution.joint_state, velocity):
+                return False
             return True
 
         # 5-DOF Yaw Sweep Fallback (xarm5_link5)
@@ -127,12 +212,95 @@ class MotionBackend:
                 ik_res = self._call_ik_sync(req)
                 if ik_res.error_code.val == 1:
                     self.node.get_logger().info(f"✅ IK Found at Yaw: {yaw_deg}°")
-                    self._execute_joint_goal(ik_res.solution.joint_state, velocity)
+                    if not self._execute_joint_goal(ik_res.solution.joint_state, velocity):
+                        return False
                     return True
         
         return False
-    
+
+    def move_cartesian_to_pose(self, x, y, z, q_dict=None, velocity=0.1, frame_id='world_world'):
+        """Move to target using Cartesian path planning (straight-line in task space).
+        Solves IK incrementally along the path — works where single-shot IK fails on 5-DOF arms."""
+        self._ensure_trajectory_mode()
+        target_link = "xarm5_link5" if self.is_xarm5 else "u1_tool0"
+
+        target = Pose()
+        target.position.x, target.position.y, target.position.z = x, y, z
+
+        if q_dict:
+            target.orientation = Quaternion(x=q_dict['qx'], y=q_dict['qy'], z=q_dict['qz'], w=q_dict['qw'])
+        else:
+            # Keep current EE orientation — safest for 5-DOF arms
+            try:
+                current_tf = self.tf_buffer.lookup_transform(frame_id, target_link, rclpy.time.Time())
+                q = current_tf.transform.rotation
+                target.orientation = Quaternion(x=q.x, y=q.y, z=q.z, w=q.w)
+            except Exception:
+                target.orientation = self._rpy_to_quaternion(math.pi, 0.0, 0.0)
+
+        req = GetCartesianPath.Request()
+        req.header.frame_id = frame_id
+        req.header.stamp = self.node.get_clock().now().to_msg()
+        req.start_state = self._get_full_robot_state()
+        req.group_name = self.group_name
+        req.link_name = target_link
+        req.waypoints = [target]
+        req.max_step = 0.01  # 1cm interpolation resolution
+        req.jump_threshold = 0.0  # Disable jump detection (unreliable for 5-DOF)
+        req.avoid_collisions = True
+
+        self.node.get_logger().info(f"🦾 Planning Cartesian path to ({x:.3f}, {y:.3f}, {z:.3f})...")
+
+        future = self._cartesian_client.call_async(req)
+        t0 = time.time()
+        while not future.done():
+            if time.time() - t0 > 15.0:
+                self.node.get_logger().error("❌ Cartesian path service timeout (15s).")
+                return False
+            time.sleep(0.01)
+
+        result = future.result()
+        if result.fraction < 0.90:
+            self.node.get_logger().warn(f"⚠️ Cartesian path only {result.fraction*100:.0f}% feasible.")
+            return False
+
+        self.node.get_logger().info(f"✅ Cartesian path {result.fraction*100:.0f}% feasible. Executing...")
+
+        # Execute the planned trajectory
+        exec_goal = ExecuteTrajectory.Goal()
+        exec_goal.trajectory = result.solution
+
+        future = self._execute_client.send_goal_async(exec_goal)
+        t0 = time.time()
+        while not future.done():
+            if time.time() - t0 > 30.0:
+                self.node.get_logger().error("❌ Cartesian trajectory acceptance timeout (30s).")
+                return False
+            time.sleep(0.01)
+
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            self.node.get_logger().error("❌ Cartesian trajectory rejected.")
+            return False
+
+        result_future = goal_handle.get_result_async()
+        t0 = time.time()
+        while not result_future.done():
+            if time.time() - t0 > 60.0:
+                self.node.get_logger().error("❌ Cartesian execution timeout (60s).")
+                return False
+            time.sleep(0.01)
+
+        exec_result = result_future.result().result
+        success = exec_result.error_code.val == 1
+        if success:
+            self.node.get_logger().info("✅ Cartesian move complete.")
+        else:
+            self.node.get_logger().warn(f"⚠️ Cartesian execution error (code: {exec_result.error_code.val}).")
+        return success
+
     def move_to_joint_positions(self, target_joints, velocity=0.2):
+        self._ensure_trajectory_mode()
         if not self.state_received.wait(timeout=2.0): return False
 
         goal = MoveGroup.Goal()
@@ -198,7 +366,7 @@ class MotionBackend:
         twist.header.frame_id = "world_world"
         twist.twist.linear.z = -abs(speed_mps)
         
-        rate = self.node.create_rate(50)
+        rate = self.node.create_rate(30)  # Match servo publish rate
         start_t = time.time()
 
         while rclpy.ok():
@@ -239,7 +407,7 @@ class MotionBackend:
         while rclpy.ok() and time.time() < end_t:
             twist.header.stamp = self.node.get_clock().now().to_msg()
             self.servo_pub.publish(twist)
-            time.sleep(0.02)
+            time.sleep(0.033)  # Match servo publish_period (0.03s / ~30Hz)
         self.servo_pub.publish(TwistStamped())
         return True
             
@@ -269,24 +437,52 @@ class MotionBackend:
         try:
             start_z = self.tf_buffer.lookup_transform('world_world', target_link, rclpy.time.Time()).transform.translation.z
             target_z = start_z + distance
-        except: return False
-            
+        except Exception as e:
+            self.node.get_logger().error(f"Retract TF Init Error: {e}")
+            return False
+
+        self.node.get_logger().info(f"🔄 Servo retract: start_z={start_z:.4f}, target_z={target_z:.4f}, dist={distance:.4f}")
+
         twist = TwistStamped()
         twist.header.frame_id = "world_world"
         twist.twist.linear.z = speed_mps if distance > 0 else -abs(speed_mps)
-        
+
         start_t = time.time()
+        tf_fail_count = 0
+        motion_checked = False
         while rclpy.ok() and (time.time() - start_t) < timeout:
             try:
                 curr_z = self.tf_buffer.lookup_transform('world_world', target_link, rclpy.time.Time()).transform.translation.z
+                tf_fail_count = 0  # reset on success
+
+                # Motion sanity check at 2s — servo might be dead (controller conflict)
+                if not motion_checked and (time.time() - start_t) > 2.0:
+                    motion_checked = True
+                    moved = abs(curr_z - start_z)
+                    expected = abs(distance) * 0.25  # at least 25% progress
+                    if moved < expected:
+                        self.servo_pub.publish(TwistStamped())
+                        self.node.get_logger().error(
+                            f"❌ Servo retract aborted: no motion detected after 2s "
+                            f"(moved {moved*1000:.1f}mm, expected >{expected*1000:.1f}mm). "
+                            f"Servo controller may be inactive.")
+                        return False
+
                 if (distance > 0 and curr_z >= target_z) or (distance < 0 and curr_z <= target_z):
                     self.servo_pub.publish(TwistStamped())
+                    self.node.get_logger().info(f"✅ Servo retract complete at z={curr_z:.4f}")
                     return True
-            except: pass
+            except Exception as e:
+                tf_fail_count += 1
+                if tf_fail_count >= 30:  # ~1 second of consecutive failures
+                    self.servo_pub.publish(TwistStamped())
+                    self.node.get_logger().error(f"❌ Servo retract aborted: TF failed {tf_fail_count} times: {e}")
+                    return False
             twist.header.stamp = self.node.get_clock().now().to_msg()
             self.servo_pub.publish(twist)
-            time.sleep(0.02)
+            time.sleep(0.033)
         self.servo_pub.publish(TwistStamped())
+        self.node.get_logger().warn(f"⚠️ Servo retract timeout ({timeout}s)")
         return False
     
     def _execute_joint_goal(self, js, vel):
@@ -294,9 +490,9 @@ class MotionBackend:
         goal = MoveGroup.Goal()
         goal.request.group_name = self.group_name
         goal.request.max_velocity_scaling_factor = vel
-        
+
         constraints = Constraints()
-        
+
         # 🎯 THE FIX: Isolate the Gripper from the Arm
         if self.is_xarm5:
             prefixes = ['xarm5', 'slider']
@@ -314,17 +510,53 @@ class MotionBackend:
                 jc.tolerance_above = jc.tolerance_below = 0.01 # Added tolerance for safety
                 constraints.joint_constraints.append(jc)
                 found_any = True
-        
+
         if not found_any:
             self.node.get_logger().error(f"❌ No joints matching {prefixes} found in message!")
-            return
+            return False
 
         goal.request.goal_constraints.append(constraints)
-        self._action_client.send_goal_async(goal)
+
+        self.node.get_logger().info(f"🦾 Sending Pose Goal for {self.group_name}...")
+
+        # Wait for goal acceptance (timeout: 30s)
+        future = self._action_client.send_goal_async(goal)
+        t0 = time.time()
+        while not future.done():
+            if time.time() - t0 > 30.0:
+                self.node.get_logger().error("❌ Pose Goal acceptance timeout (30s).")
+                return False
+            time.sleep(0.01)
+
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            self.node.get_logger().error("❌ Pose Goal Rejected by MoveIt.")
+            return False
+
+        # Wait for execution (timeout: 60s)
+        result_future = goal_handle.get_result_async()
+        t0 = time.time()
+        while not result_future.done():
+            if time.time() - t0 > 60.0:
+                self.node.get_logger().error("❌ Pose Goal execution timeout (60s).")
+                return False
+            time.sleep(0.01)
+
+        success = result_future.result().result.error_code.val == 1
+        if success:
+            self.node.get_logger().info("✅ Pose Goal Complete.")
+        else:
+            self.node.get_logger().warn("⚠️ Pose Goal execution did not return success.")
+        return success
 
     def _call_ik_sync(self, req):
         future = self._ik_client.call_async(req)
-        while not future.done(): time.sleep(0.01)
+        t0 = time.time()
+        while not future.done():
+            if time.time() - t0 > 10.0:
+                self.node.get_logger().error("❌ IK service timeout (10s).")
+                return type('FakeResult', (), {'error_code': type('EC', (), {'val': -1})()})()
+            time.sleep(0.01)
         return future.result()
 
     def _get_full_robot_state(self):

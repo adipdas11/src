@@ -946,7 +946,7 @@
       </xacro:if>
 
       <xacro:if value="${'$(arg hw_type)' == 'isaac'}">
-        <plugin>isaac_ros2_control/IsaacSystem</plugin>
+        <plugin>topic_based_ros2_control/TopicBasedSystem</plugin>
         <param name="joint_commands_topic">/isaac_joint_commands</param>
         <param name="joint_states_topic">/isaac_joint_states</param>
       </xacro:if>
@@ -955,9 +955,7 @@
     <joint name="slider_slider_joint">
       <command_interface name="position"/>
       <state_interface name="position">
-        <xacro:if value="${'$(arg hw_type)' == 'fake'}">
-          <param name="initial_value">0.0</param>
-        </xacro:if>
+        <xacro:if value="${'$(arg hw_type)' in ['fake', 'isaac']}"><param name="initial_value">0.0</param></xacro:if>
       </state_interface>
       <state_interface name="velocity"/>
       <state_interface name="effort"/>
@@ -966,7 +964,7 @@
     <joint name="xarm5_joint1">
       <command_interface name="position"/>
       <state_interface name="position">
-        <xacro:if value="${'$(arg hw_type)' == 'fake'}"><param name="initial_value">0.0</param></xacro:if>
+        <xacro:if value="${'$(arg hw_type)' in ['fake', 'isaac']}"><param name="initial_value">0.0</param></xacro:if>
       </state_interface>
       <state_interface name="velocity"/>
       <state_interface name="effort"/>
@@ -975,7 +973,7 @@
     <joint name="xarm5_joint2">
       <command_interface name="position"/>
       <state_interface name="position">
-        <xacro:if value="${'$(arg hw_type)' == 'fake'}"><param name="initial_value">0.0</param></xacro:if>
+        <xacro:if value="${'$(arg hw_type)' in ['fake', 'isaac']}"><param name="initial_value">0.0</param></xacro:if>
       </state_interface>
       <state_interface name="velocity"/>
       <state_interface name="effort"/>
@@ -984,7 +982,7 @@
     <joint name="xarm5_joint3">
       <command_interface name="position"/>
       <state_interface name="position">
-        <xacro:if value="${'$(arg hw_type)' == 'fake'}"><param name="initial_value">-1.5708</param></xacro:if>
+        <xacro:if value="${'$(arg hw_type)' in ['fake', 'isaac']}"><param name="initial_value">-1.5708</param></xacro:if>
       </state_interface>
       <state_interface name="velocity"/>
       <state_interface name="effort"/>
@@ -993,7 +991,7 @@
     <joint name="xarm5_joint4">
       <command_interface name="position"/>
       <state_interface name="position">
-        <xacro:if value="${'$(arg hw_type)' == 'fake'}"><param name="initial_value">1.5708</param></xacro:if>
+        <xacro:if value="${'$(arg hw_type)' in ['fake', 'isaac']}"><param name="initial_value">1.5708</param></xacro:if>
       </state_interface>
       <state_interface name="velocity"/>
       <state_interface name="effort"/>
@@ -1002,7 +1000,7 @@
     <joint name="xarm5_joint5">
       <command_interface name="position"/>
       <state_interface name="position">
-        <xacro:if value="${'$(arg hw_type)' == 'fake'}"><param name="initial_value">0.0</param></xacro:if>
+        <xacro:if value="${'$(arg hw_type)' in ['fake', 'isaac']}"><param name="initial_value">0.0</param></xacro:if>
       </state_interface>
       <state_interface name="velocity"/>
       <state_interface name="effort"/>
@@ -1011,7 +1009,7 @@
     <joint name="u1_joint1">
       <command_interface name="position"/>
       <state_interface name="position">
-        <xacro:if value="${'$(arg hw_type)' == 'fake'}"><param name="initial_value">0.0</param></xacro:if>
+        <xacro:if value="${'$(arg hw_type)' in ['fake', 'isaac']}"><param name="initial_value">0.0</param></xacro:if>
       </state_interface>
       <state_interface name="velocity"/>
       <state_interface name="effort"/>
@@ -1020,7 +1018,7 @@
     <joint name="u1_joint2">
       <command_interface name="position"/>
       <state_interface name="position">
-        <xacro:if value="${'$(arg hw_type)' == 'fake'}"><param name="initial_value">0.0</param></xacro:if>
+        <xacro:if value="${'$(arg hw_type)' in ['fake', 'isaac']}"><param name="initial_value">0.0</param></xacro:if>
       </state_interface>
       <state_interface name="velocity"/>
       <state_interface name="effort"/>
@@ -1029,7 +1027,7 @@
     <joint name="u1_joint3">
       <command_interface name="position"/>
       <state_interface name="position">
-        <xacro:if value="${'$(arg hw_type)' == 'fake'}"><param name="initial_value">-1.5708</param></xacro:if>
+        <xacro:if value="${'$(arg hw_type)' in ['fake', 'isaac']}"><param name="initial_value">-1.5708</param></xacro:if>
       </state_interface>
       <state_interface name="velocity"/>
       <state_interface name="effort"/>
@@ -1038,7 +1036,7 @@
     <joint name="u1_joint4">
       <command_interface name="position"/>
       <state_interface name="position">
-        <xacro:if value="${'$(arg hw_type)' == 'fake'}"><param name="initial_value">0.0</param></xacro:if>
+        <xacro:if value="${'$(arg hw_type)' in ['fake', 'isaac']}"><param name="initial_value">0.0</param></xacro:if>
       </state_interface>
       <state_interface name="velocity"/>
       <state_interface name="effort"/>
@@ -1047,7 +1045,7 @@
     <joint name="u1_joint5">
       <command_interface name="position"/>
       <state_interface name="position">
-        <xacro:if value="${'$(arg hw_type)' == 'fake'}"><param name="initial_value">-1.5708</param></xacro:if>
+        <xacro:if value="${'$(arg hw_type)' in ['fake', 'isaac']}"><param name="initial_value">-1.5708</param></xacro:if>
       </state_interface>
       <state_interface name="velocity"/>
       <state_interface name="effort"/>
@@ -1056,7 +1054,7 @@
     <joint name="u1_joint6">
       <command_interface name="position"/>
       <state_interface name="position">
-        <xacro:if value="${'$(arg hw_type)' == 'fake'}"><param name="initial_value">0.0</param></xacro:if>
+        <xacro:if value="${'$(arg hw_type)' in ['fake', 'isaac']}"><param name="initial_value">0.0</param></xacro:if>
       </state_interface>
       <state_interface name="velocity"/>
       <state_interface name="effort"/>
@@ -1065,7 +1063,7 @@
     <joint name="rg6_l_out">
       <command_interface name="position"/>
       <state_interface name="position">
-        <xacro:if value="${'$(arg hw_type)' == 'fake'}"><param name="initial_value">0.0</param></xacro:if>
+        <xacro:if value="${'$(arg hw_type)' in ['fake', 'isaac']}"><param name="initial_value">0.0</param></xacro:if>
       </state_interface>
       <state_interface name="velocity"/>
       <state_interface name="effort"/>

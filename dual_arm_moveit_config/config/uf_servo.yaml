@@ -1,12 +1,12 @@
 ###############################################
-# UF850 Servo Configuration
+# UF850 Servo Configuration (6-DOF)
 ###############################################
 use_gazebo: false
-command_in_type: unitless
+command_in_type: speed_units
 scale:
-  linear:  0.8  
-  rotational:  0.8 
-  joint: 0.5 
+  linear:  0.3
+  rotational:  0.3
+  joint: 0.05
 
 # What to publish?
 command_out_topic: /uf_controller/joint_trajectory
@@ -17,27 +17,27 @@ command_in_topic: "/uf_servo_node/delta_twist_cmds"
 joint_topic: /joint_states
 
 # Frame settings
-robot_link_command_frame: u1_tool0  
-planning_frame: sd1_base_link 
-ee_frame_name: u1_tool0         
+robot_link_command_frame: u1_tool0
+planning_frame: sd1_base_link
+ee_frame_name: u1_tool0
 
 # Collision checking
 check_collisions: false
 collision_check_rate: 10.0
 collision_check_type: threshold_distance
-self_collision_proximity_threshold: 0.01 
-scene_collision_proximity_threshold: 0.02 
+self_collision_proximity_threshold: 0.01
+scene_collision_proximity_threshold: 0.02
 
 # Loop rates
-publish_period: 0.02
-low_pass_filter_coeff: 1.0  
-incoming_command_timeout: 0.5 
-use_halt_position_resolution: false
-num_outgoing_halo_msgs: 4 
+publish_period: 0.03
+low_pass_filter_coeff: 5.0
+smoothing_filter_plugin_name: "online_signal_smoothing::ButterworthFilterPlugin"
+incoming_command_timeout: 0.3
+num_outgoing_halt_msgs_to_publish: 4
 
 # IK Settings
 move_group_name: uf_arm
 is_primary_planning_scene_monitor: false
-lower_singularity_threshold:  10.0 
-hard_stop_singularity_threshold: 40.0 
-joint_limit_margin: 0.05
+lower_singularity_threshold:  30.0
+hard_stop_singularity_threshold: 80.0
+joint_limit_margin: 0.1

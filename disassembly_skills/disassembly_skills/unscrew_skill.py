@@ -3,6 +3,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.executors import MultiThreadedExecutor
 from std_msgs.msg import String, Int8
+from std_srvs.srv import Trigger
 from geometry_msgs.msg import Pose
 import json, time, threading, copy, math
 from disassembly_skills.motion_backend import MotionBackend
@@ -15,7 +16,7 @@ class UnscrewSkill(Node):
         
         # --- Physical Parameters ---
         self.TOOL_LENGTH = 0.240       
-        self.HOVER_GAP = 0.008         
+        self.HOVER_GAP = 0.007         
         self.TRANSIT_LIFT = 0.050      
         self.REACH_LIMIT = 0.680       
         self.MM_PER_PIX = 0.000130     
@@ -30,7 +31,8 @@ class UnscrewSkill(Node):
         self.bin_sub = self.create_subscription(String, '/vision/bin_coordinates', self.bin_callback, 10)
         self.state_pub = self.create_publisher(String, '/robot_state/tool_arm/update', 10)
         self.tool_pub = self.create_publisher(Int8, '/tool_cmd', 10)
-        
+        self.xarm_servo_start_client = self.create_client(Trigger, '/xarm_servo_node/start_servo')
+
         self.data_lock = threading.Lock()
         self.latest_targets = []
         self.local_view = {}
@@ -105,9 +107,9 @@ class UnscrewSkill(Node):
         print("\n🔍 [STAIRCASE] Starting Sequential Crosshair Alignment & Descent...")
         
         # --- ⚙️ SPEED & VELOCITY CONTROLS ---
-        XY_SPEED_GAIN = 10.0      
-        Z_MAX_SPEED = 0.010       # 🛑 CHANGED: Max 10mm/s cap for funnel logic 
-        MAX_XY_STEP = 0.025       
+        XY_SPEED_GAIN = 5.0      
+        Z_MAX_SPEED = 0.005       # 🛑 CHANGED: Max 10mm/s cap for funnel logic 
+        MAX_XY_STEP = 0.010       
         
         # --- 🌀 AGGRESSIVE FAST SPIRAL SEARCH CONTROLS ---
         SPIRAL_GAP_MM = 15.0         
@@ -451,13 +453,28 @@ class UnscrewSkill(Node):
 
         if interactive: input("👉 GATE 1: Press [ENTER] to Approach Hover...")
         self.moveit_backend.retract_relative_z(self.TRANSIT_LIFT)
-        
-        if self.moveit_backend.move_to_pose_robust(tx_world, ty_world, tz_flange_hover):
+        self.wait_for_arm_settled()
+
+        # Try Cartesian path first (incremental IK — works where single-shot fails on 5-DOF)
+        hover_ok = self.moveit_backend.move_cartesian_to_pose(tx_world, ty_world, tz_flange_hover)
+        if not hover_ok:
+            print("⚠️ Cartesian path failed. Falling back to IK + yaw sweep...")
+            hover_ok = self.moveit_backend.move_to_pose_robust(tx_world, ty_world, tz_flange_hover)
+
+        if hover_ok:
             print("✅ [STATUS] Hover Complete.")
-            
-            # 🛑 NEW FIX: Wait for xArm to settle ONLY after arriving at the hover pose
+
             self.wait_for_arm_settled()
-            
+
+            # Start xArm servo controller before staircase descent
+            print("⏰ Activating xArm Servo Controller...")
+            if self.xarm_servo_start_client.wait_for_service(timeout_sec=5.0):
+                req_f = self.xarm_servo_start_client.call_async(Trigger.Request())
+                while rclpy.ok() and not req_f.done(): time.sleep(0.01)
+            else:
+                print("⚠️ xArm servo start service not available. Proceeding anyway.")
+            time.sleep(1.0)  # Allow controller transition to complete
+
             if interactive: input("👉 GATE 2: Press [ENTER] to start Force-Controlled Staircase Descent...")
             
             # 🛑 NEW: Capture the staircase result to check for the HOLE_TIMEOUT
@@ -524,7 +541,7 @@ def main(args=None):
                 if node.latest_targets: target_id = node.latest_targets[0]['id']
             if target_id is not None:
                 # In standalone mode, we can test it interactively
-                node.execute_unscrew_command(target_id, target_label="screw", interactive=True)
+                node.execute_unscrew_command(target_id, target_label="screw", interactive=False)
                 with node.data_lock: node.latest_targets = []
             time.sleep(0.5)
     except KeyboardInterrupt: pass

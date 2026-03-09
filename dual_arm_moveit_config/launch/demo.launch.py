@@ -189,8 +189,15 @@ def launch_setup(context, *args, **kwargs):
             ])
         )
     elif hw_type == 'isaac':
+        # topic_based_ros2_control bridges ROS 2 control <-> Isaac Sim via topics:
+        #   /isaac_joint_states  <- Isaac Sim publishes joint states
+        #   /isaac_joint_commands -> Isaac Sim receives joint commands
+        # ros2_control_node still runs on this machine; Isaac Sim is NOT the controller manager.
         launch_sequence.append(
-            LogInfo(msg="🌌 Step 2: Waiting for Isaac Sim to host the Controller Manager...")
+            TimerAction(period=2.0, actions=[
+                LogInfo(msg="🌌 Step 2: Starting ROS 2 Control Node (Isaac Sim bridge on /isaac_joint_states + /isaac_joint_commands)..."),
+                ros2_control_node
+            ])
         )
 
     # Remaining sequence starts safely AFTER Step 2B
@@ -205,9 +212,14 @@ def launch_setup(context, *args, **kwargs):
             run_move_group_node, tool_controller, handeye_publisher
         ]),
 
+        # TimerAction(period=18.0, actions=[
+        #     LogInfo(msg="🕹️  Step 5: Starting Teleop & MoveIt Servo..."),
+        #     teleoperate, teleop_bridge, xarm_servo_node, uf_servo_node
+        # ]),
+        
         TimerAction(period=18.0, actions=[
             LogInfo(msg="🕹️  Step 5: Starting Teleop & MoveIt Servo..."),
-            teleoperate, teleop_bridge, xarm_servo_node, uf_servo_node
+            xarm_servo_node, uf_servo_node
         ]),
 
         TimerAction(period=21.0, actions=[

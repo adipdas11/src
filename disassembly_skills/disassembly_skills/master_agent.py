@@ -291,12 +291,12 @@ class MasterAgentNode(Node):
     # -----------------------------------------------------------------------------
     async def hold_object(self, part_id=None, label=None):
         if part_id is None or label is None: return "Action failed, missing required parameter"
-        self.hold_skill.execute_hold(part_id=part_id, target_label=label, interactive=False)
+        await asyncio.to_thread(self.hold_skill.execute_hold, part_id=part_id, target_label=label, interactive=False)
         return "Tool called successfully"
 
     async def unscrew(self, unscrew_id=None, unscrew_label=None):
         if unscrew_id is None or unscrew_label is None: return "Action failed, missing required parameter"
-        
+
         # --- NEW: Retrieve XYZ before action to log to Spatial Memory ---
         target_xyz = None
         with self.vision_lock:
@@ -305,28 +305,28 @@ class MasterAgentNode(Node):
                     target_xyz = obj.get('xyz')
                     break
 
-        self.unscrew_skill.execute_unscrew_command(target_id=unscrew_id, target_label=unscrew_label, interactive=False)
-        
+        await asyncio.to_thread(self.unscrew_skill.execute_unscrew_command, target_id=unscrew_id, target_label=unscrew_label, interactive=False)
+
         # --- NEW: Add coordinates to Exclusion Zones ---
         if target_xyz:
             self.cleared_zones.append(target_xyz)
             print(f"🛑 [MEMORY] Added Exclusion Zone at {target_xyz} (Radius: {self.EXCLUSION_RADIUS*1000}mm)")
-            
+
         return "Tool called successfully"
 
     # 🆕 NEW ASYNC WRAPPERS FOR NEW SKILLS
     async def flip_object(self):
-        self.flip_skill.execute_flip(interactive=False)
+        await asyncio.to_thread(self.flip_skill.execute_flip, interactive=False)
         return "Tool called successfully: Object flipped"
 
     async def flip_drop(self):
-        self.flip_drop_skill.execute_flip_drop(interactive=False)
+        await asyncio.to_thread(self.flip_drop_skill.execute_flip_drop, interactive=False)
         return "Tool called successfully: Object dropped"
 
     async def lift_and_drop(self, object_id=None, object_name=None):
         if object_id == None or object_name == None:
             return "Action failed, missing object_id or object_name parameter"
-            
+
         # # --- NEW: Retrieve XYZ before action to log to Spatial Memory ---
         # target_xyz = None
         # with self.vision_lock:
@@ -334,20 +334,20 @@ class MasterAgentNode(Node):
         #         if obj.get('id') == object_id:
         #             target_xyz = obj.get('xyz')
         #             break
-                    
+
         # pass # Execution logic
-        
+
         # # --- NEW: Add coordinates to Exclusion Zones ---
         # if target_xyz:
         #     self.cleared_zones.append(target_xyz)
         #     print(f"🛑 [MEMORY] Added Exclusion Zone at {target_xyz} to hide removed part.")
-            
+
         return "Tool called successfully"
-    
+
     async def pickup_object(self, pickup_id=None, pickup_label=None):
         if pickup_id == None or pickup_label == None:
             return "Action failed, missing pickup_id or pickup_label parameter"
-        self.pickup_skill.execute_pickup(target_id=pickup_id, target_label=pickup_label, interactive=False)
+        await asyncio.to_thread(self.pickup_skill.execute_pickup, target_id=pickup_id, target_label=pickup_label)
         return "Tool called successfully"
 
     # -----------------------------------------------------------------------------
@@ -608,7 +608,7 @@ class MasterAgentNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = MasterAgentNode()
-    executor = rclpy.executors.MultiThreadedExecutor()
+    executor = rclpy.executors.MultiThreadedExecutor(num_threads=8)
     executor.add_node(node)
     executor.add_node(node.unscrew_skill)
     executor.add_node(node.hold_skill)

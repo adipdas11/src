@@ -1,0 +1,19 @@
+hand_tracker:
+  ros__parameters:
+    camera_id: 0
+    camera_width: 1280
+    camera_height: 720
+    max_hands: 2
+    detection_confidence: 0.5
+    tracking_confidence: 0.4
+    show_visualization: true
+    flip_horizontal: true       # Mirror mode so left/right feel natural
+    persistence_frames: 8       # Hold last detection for N frames when tracking drops
+
+    # Body pose tracking (MediaPipe Pose for whole-arm teleoperation)
+    enable_pose: true           # Enable shoulder/elbow/wrist tracking
+    pose_model_path: ''         # Auto-resolves to config/pose_landmarker_lite.task
+
+    # Depth estimation (Depth Anything V2 on GPU for real monocular depth)
+    enable_depth_model: true    # Use Depth Anything V2 Small for Z control
+    depth_run_every_n: 3        # Run depth inference every N frames (performance)

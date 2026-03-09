@@ -17,8 +17,8 @@ class TeleopBridge(Node):
         self.planning_frame = 'world_world' 
         
         # ⚙️ Scales & Filters
-        self.linear_scale = 0.8   
-        self.angular_scale = 0.8  
+        self.linear_scale = 0.3   # m/s max (speed_units mode)
+        self.angular_scale = 0.3  # rad/s max (speed_units mode)
         self.joystick_alpha = 0.12 
 
         # 📐 6-Axis State
@@ -51,7 +51,7 @@ class TeleopBridge(Node):
         self.grab_active = False
         self.deadman_active = False
         
-        self.create_timer(0.02, self.continuous_twist_publisher)
+        self.create_timer(0.033, self.continuous_twist_publisher)  # Match servo publish rate
         self.sync_timer = self.create_timer(2.0, self.initial_sync_timer_callback)
 
         self.get_logger().info("🦾 DISASSEMBLY MASTER BRIDGE: R1 Gripper Mapping Online")
