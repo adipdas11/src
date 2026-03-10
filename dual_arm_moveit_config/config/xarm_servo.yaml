@@ -4,8 +4,8 @@
 use_gazebo: false
 command_in_type: speed_units
 scale:
-  linear:  0.3
-  rotational:  0.3
+  linear:  0.15
+  rotational:  0.15
   joint: 0.05
 
 # What to publish?
@@ -29,11 +29,11 @@ self_collision_proximity_threshold: 0.01
 scene_collision_proximity_threshold: 0.02 
 
 # Loop rates
-publish_period: 0.03
-low_pass_filter_coeff: 5.0
+publish_period: 0.04
+low_pass_filter_coeff: 2.0
 smoothing_filter_plugin_name: "online_signal_smoothing::ButterworthFilterPlugin"
-incoming_command_timeout: 0.3
-num_outgoing_halt_msgs_to_publish: 4
+incoming_command_timeout: 0.5
+num_outgoing_halt_msgs_to_publish: 10
 
 # IK Settings
 move_group_name: xarm_arm

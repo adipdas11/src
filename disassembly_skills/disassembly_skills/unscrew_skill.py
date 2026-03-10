@@ -129,8 +129,8 @@ class UnscrewSkill(Node):
         ALIGN_TOLERANCE_PX = 10.0    
         RETRACT_DIST = 0.005         
         # --- 🔄 WIGGLE TEST CONTROLS ---
-        WIGGLE_VELOCITY = 0.033     # m/s → ~10mm/s actual (with 0.3 scale) → ~5.0mm in 0.5s
-        WIGGLE_SPIKE_VALUE = 0.5     
+        WIGGLE_VELOCITY = 0.020     # m/s — gentle wiggle (~3mm/s with 0.15 servo scale)
+        WIGGLE_SPIKE_VALUE = 0.5
         
         with self.data_lock:
             force_data = self.local_view.get('force_torque', {}).get('force', {})
@@ -209,28 +209,42 @@ class UnscrewSkill(Node):
                 successful_wiggles = 0
                 
                 for w_dx, w_dy, axis, name in wiggle_directions:
-                    # Push — enough displacement to detect force reaction
-                    self.moveit_backend.jog_cartesian_servo(w_dx, w_dy, 0.0, duration=0.5)
-                    time.sleep(0.2) 
-                    
+                    # Ramp up smoothly over 0.3s, hold 0.2s, then ramp down
+                    RAMP_STEPS = 6
+                    RAMP_DT = 0.05
+                    for step in range(1, RAMP_STEPS + 1):
+                        frac = step / RAMP_STEPS
+                        self.moveit_backend.jog_cartesian_servo(
+                            w_dx * frac, w_dy * frac, 0.0, duration=RAMP_DT, stop_after=False)
+                    # Hold at full speed briefly
+                    self.moveit_backend.jog_cartesian_servo(w_dx, w_dy, 0.0, duration=0.2, stop_after=False)
+                    # Stop and read force
+                    self.moveit_backend.jog_cartesian_servo(0.0, 0.0, 0.0, duration=0.1)
+                    time.sleep(0.1)
+
                     with self.data_lock:
                         curr_fx = self.local_view.get('force_torque', {}).get('force', {}).get('x', 0.0)
                         curr_fy = self.local_view.get('force_torque', {}).get('force', {}).get('y', 0.0)
-                        
+
                     if axis == 'x':
                         spike = abs(curr_fx - wiggle_base_fx)
                     else:
                         spike = abs(curr_fy - wiggle_base_fy)
-                        
+
                     if spike > WIGGLE_SPIKE_VALUE:
                         print(f"  ✅ Wiggle {name} SUCCESS | Spike: {spike:.2f}N (Required: {WIGGLE_SPIKE_VALUE}N)")
                         successful_wiggles += 1
                     else:
                         print(f"  ❌ Wiggle {name} FAIL | Spike: {spike:.2f}N (Required: {WIGGLE_SPIKE_VALUE}N)")
-                        
-                    # Return to center
-                    self.moveit_backend.jog_cartesian_servo(-w_dx, -w_dy, 0.0, duration=0.5)
-                    time.sleep(0.2)
+
+                    # Return to center with ramp
+                    for step in range(1, RAMP_STEPS + 1):
+                        frac = step / RAMP_STEPS
+                        self.moveit_backend.jog_cartesian_servo(
+                            -w_dx * frac, -w_dy * frac, 0.0, duration=RAMP_DT, stop_after=False)
+                    self.moveit_backend.jog_cartesian_servo(-w_dx, -w_dy, 0.0, duration=0.2, stop_after=False)
+                    self.moveit_backend.jog_cartesian_servo(0.0, 0.0, 0.0, duration=0.1)
+                    time.sleep(0.1)
 
                 # --- RETRY LOGIC FOR WIGGLE FAIL ---
                 if successful_wiggles < 3:
@@ -290,10 +304,8 @@ class UnscrewSkill(Node):
                 dy = max(min(dy, MAX_SPIRAL_STEP), -MAX_SPIRAL_STEP)
                 
                 print(f"⚠️ Vision lost. Spiral search Step {spiral_idx} | dx:{dx*1000:.1f} dy:{dy*1000:.1f} mm/s")
-                # Use longer duration with short gap to keep servo commands flowing
-                # continuously — avoids start-stop jerk from command timeout gaps
-                self.moveit_backend.jog_cartesian_servo(dx, dy, 0.0, duration=0.3)
-                time.sleep(0.1)
+                # stop_after=False keeps commands flowing — avoids start-stop jerk
+                self.moveit_backend.jog_cartesian_servo(dx, dy, 0.0, duration=0.15, stop_after=False)
                 continue
 
             # Reset spiral variables if we found the screw
@@ -356,8 +368,7 @@ class UnscrewSkill(Node):
             
             print(f"📉 {align_state} | Fz: {diff_fz:.2f}N | ErrX: {err_x:>5.1f} | ErrY: {err_y:>5.1f} | Total: {dist_px:.1f}px | Vx:{smooth_joy_x*1000:.1f} Vy:{smooth_joy_y*1000:.1f} Vz:{dynamic_z_speed*1000:.1f} mm/s")
             
-            self.moveit_backend.jog_cartesian_servo(smooth_joy_x, smooth_joy_y, -dynamic_z_speed, duration=0.3)
-            time.sleep(0.1)  # Short gap for vision update
+            self.moveit_backend.jog_cartesian_servo(smooth_joy_x, smooth_joy_y, -dynamic_z_speed, duration=0.15, stop_after=False)
 
         return False
 

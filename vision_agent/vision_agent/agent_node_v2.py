@@ -30,8 +30,8 @@ DASHBOARD_HEIGHT = 550
 PROCESSING_RATE_HZ = 15.0 
 
 # --- LOCAL VIEW ALIGNMENT SETTINGS ---
-LOCAL_CROSSHAIR_OFFSET_X = 25  # pixels
-LOCAL_CROSSHAIR_OFFSET_Y = 14   # pixels
+LOCAL_CROSSHAIR_OFFSET_X = 50  # pixels
+LOCAL_CROSSHAIR_OFFSET_Y = -8   # pixels
 
 # --- IMPORT AGENTS ---
 from vision_agent.agents.scout import ScoutAgent

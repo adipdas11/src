@@ -19,7 +19,8 @@ GRIPPER_IP = '192.168.1.1'
 
 RAD_OPEN = 0.6; RAD_CLOSE = -0.6; RAD_RANGE = RAD_OPEN - RAD_CLOSE
 MM_CLOSE = 0.0; MM_OPEN = 160.0      
-MAX_RAD_JUMP = 0.4  
+MAX_RAD_JUMP = 0.3   # Hard reject: if any joint cmd is > 0.3 rad (~17 deg) from current pos, drop entirely
+                      # This catches startup jumps and planning errors without interfering with normal motion
 
 class RG:
     def __init__(self, gripper, ip, logger, port=502):
@@ -161,6 +162,7 @@ class RealHardware(Node):
         self.cmd_sub = self.create_subscription(JointState, '/robot_joint_commands', self.joint_command_callback, 10, callback_group=self.cb_group)
 
         self.loop_count = 0; self.cached_gripper_width = 80.0
+
         self.perform_blocking_sync()
 
     def perform_blocking_sync(self):
@@ -244,7 +246,7 @@ class RealHardware(Node):
 
     def joint_command_callback(self, msg):
         if self.velocity_mode_active or not self.initial_sync_complete: return
-        
+
         xarm_cmds = [None]*5; uf_cmds = [None]*6; slider_cmd = None; gripper_cmd = None
         for i, name in enumerate(msg.name):
             if 'xarm5_joint' in name: xarm_cmds[int(name[-1]) - 1] = msg.position[i]
@@ -252,14 +254,32 @@ class RealHardware(Node):
             elif 'slider_slider_joint' == name: slider_cmd = msg.position[i]
             elif 'rg6_l_out' == name: gripper_cmd = msg.position[i]
 
+        # --- xArm5: Hard reject only (no clamp — speed control is in servo config) ---
         if all(c is not None for c in xarm_cmds) and self.xarm.connected:
             curr_x, _, _ = self.xarm.get_full_state()
-            if all(abs(curr - cmd) < MAX_RAD_JUMP for curr, cmd in zip(curr_x, xarm_cmds)):
+            deltas = [abs(c - p) for c, p in zip(xarm_cmds, curr_x)]
+            max_delta = max(deltas)
+            if max_delta >= MAX_RAD_JUMP:
+                worst_j = deltas.index(max_delta)
+                self.get_logger().warn(
+                    f"🛑 xArm5 REJECT: joint{worst_j+1} delta={max_delta:.3f}rad "
+                    f"(cmd={xarm_cmds[worst_j]:.3f} cur={curr_x[worst_j]:.3f})",
+                    throttle_duration_sec=0.5)
+            else:
                 self.xarm.set_servo_angle(xarm_cmds)
 
+        # --- UF850: Hard reject only ---
         if all(c is not None for c in uf_cmds) and self.uf850.connected:
             curr_u, _, _ = self.uf850.get_full_state()
-            if all(abs(curr - cmd) < MAX_RAD_JUMP for curr, cmd in zip(curr_u, uf_cmds)):
+            deltas = [abs(c - p) for c, p in zip(uf_cmds, curr_u)]
+            max_delta = max(deltas)
+            if max_delta >= MAX_RAD_JUMP:
+                worst_j = deltas.index(max_delta)
+                self.get_logger().warn(
+                    f"🛑 UF850 REJECT: joint{worst_j+1} delta={max_delta:.3f}rad "
+                    f"(cmd={uf_cmds[worst_j]:.3f} cur={curr_u[worst_j]:.3f})",
+                    throttle_duration_sec=0.5)
+            else:
                 self.uf850.set_servo_angle(uf_cmds)
 
         if slider_cmd is not None: self.xarm.set_linear_track(slider_cmd)

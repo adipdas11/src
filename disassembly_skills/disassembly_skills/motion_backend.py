@@ -332,14 +332,14 @@ class MotionBackend:
         twist = TwistStamped()
         twist.header.frame_id = "world_world"
         twist.twist.linear.z = -abs(speed_mps)
-        
-        rate = self.node.create_rate(30)  # Match servo publish rate
+
         start_t = time.time()
+        next_pub = time.monotonic()
 
         while rclpy.ok():
             curr = self.current_joint_efforts.get(joint_name, 0.0)
             spike = abs(curr - baseline)
-            
+
             # Blanking period (0.2s) to ignore initial jerk
             if (time.time() - start_t) > 0.2:
                 if spike > threshold_nm:
@@ -347,9 +347,14 @@ class MotionBackend:
                     self.node.get_logger().warn(f"🎯 CONTACT DETECTED: {spike:.3f}Nm spike.")
                     return True
 
-            twist.header.stamp = self.node.get_clock().now().to_msg()
-            self.servo_pub.publish(twist)
-            rate.sleep()
+            now_mono = time.monotonic()
+            if now_mono >= next_pub:
+                twist.header.stamp = self.node.get_clock().now().to_msg()
+                self.servo_pub.publish(twist)
+                next_pub += 0.04
+                if next_pub < now_mono:
+                    next_pub = now_mono + 0.04
+            time.sleep(0.001)
         return False
     
     def retract_relative_z(self, distance):
@@ -366,17 +371,33 @@ class MotionBackend:
         except Exception as e:
             self.node.get_logger().error(f"Retract TF Error: {e}"); return False
 
-    def jog_cartesian_servo(self, dx, dy, dz, duration=1.0):
-        """Fine-grained cartesian jogging via MoveIt Servo."""
+    def jog_cartesian_servo(self, dx, dy, dz, duration=1.0, stop_after=True):
+        """Fine-grained cartesian jogging via MoveIt Servo.
+        Set stop_after=False when calling in a tight loop to avoid jerk between calls.
+        Uses monotonic deadline pacing to compensate for non-RT kernel jitter."""
         self._ensure_servo_mode()
         twist = TwistStamped(); twist.header.frame_id = "world_world"
         twist.twist.linear.x, twist.twist.linear.y, twist.twist.linear.z = dx, dy, dz
-        end_t = time.time() + duration
-        while rclpy.ok() and time.time() < end_t:
-            twist.header.stamp = self.node.get_clock().now().to_msg()
-            self.servo_pub.publish(twist)
-            time.sleep(0.033)  # Match servo publish_period (0.03s / ~30Hz)
-        self.servo_pub.publish(TwistStamped())
+
+        period = 0.04  # 25Hz — more forgiving than 30Hz on non-RT kernels
+        end_t = time.monotonic() + duration
+        next_publish = time.monotonic()
+
+        while rclpy.ok() and time.monotonic() < end_t:
+            now = time.monotonic()
+            if now >= next_publish:
+                twist.header.stamp = self.node.get_clock().now().to_msg()
+                self.servo_pub.publish(twist)
+                # Schedule next publish relative to deadline, not current time
+                # This absorbs jitter: if we're late, next cycle is shorter
+                next_publish += period
+                # If we fell behind by more than one period, reset
+                if next_publish < now:
+                    next_publish = now + period
+            # Short busy-wait yields CPU but doesn't overshoot like sleep(0.033)
+            time.sleep(0.001)
+        if stop_after:
+            self.servo_pub.publish(TwistStamped())
         return True
             
     def get_transformed_pose(self, source_pose, source_frame, target_frame, z_offset=0.0):
@@ -419,6 +440,7 @@ class MotionBackend:
         start_t = time.time()
         tf_fail_count = 0
         motion_checked = False
+        next_pub = time.monotonic()
         while rclpy.ok() and (time.time() - start_t) < timeout:
             try:
                 curr_z = self.tf_buffer.lookup_transform('world_world', target_link, rclpy.time.Time()).transform.translation.z
@@ -448,9 +470,14 @@ class MotionBackend:
                     self.servo_pub.publish(TwistStamped())
                     self.node.get_logger().error(f"❌ Servo retract aborted: TF failed {tf_fail_count} times: {e}")
                     return False
-            twist.header.stamp = self.node.get_clock().now().to_msg()
-            self.servo_pub.publish(twist)
-            time.sleep(0.033)
+            now_mono = time.monotonic()
+            if now_mono >= next_pub:
+                twist.header.stamp = self.node.get_clock().now().to_msg()
+                self.servo_pub.publish(twist)
+                next_pub += 0.04
+                if next_pub < now_mono:
+                    next_pub = now_mono + 0.04
+            time.sleep(0.001)
         self.servo_pub.publish(TwistStamped())
         self.node.get_logger().warn(f"⚠️ Servo retract timeout ({timeout}s)")
         return False
