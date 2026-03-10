@@ -3,76 +3,564 @@ import rclpy
 from rclpy.node import Node
 from rclpy.executors import MultiThreadedExecutor
 from std_msgs.msg import String, Int8
-from geometry_msgs.msg import Pose, TransformStamped
+from geometry_msgs.msg import Pose
 import tf2_ros
-
 import json
 import time
 import threading
 import sys
 import copy
 import math
-import numpy as np 
+import numpy as np
+from xarm.wrapper import XArmAPI
 
-from disassembly_skills.motion_backend import MotionBackend
+# ==========================================
+# DUAL-ARM SYSTEM CONFIG
+# ==========================================
+XARM_IP = '192.168.1.239'
 
 class UnscrewSkill(Node):
     def __init__(self):
         super().__init__('unscrew_skill_node')
-        self.moveit_backend = MotionBackend(self, "xarm_arm")
         
+        # 1. Backends
+        # Direct SDK connection for precision control
+        self.get_logger().info(f"🔌 Connecting Direct SDK to xArm at {XARM_IP}...")
+        self.arm = XArmAPI(XARM_IP, is_radian=False)
+        self.arm.clean_error()
+        self.arm.motion_enable(enable=True)
+        self.arm.set_mode(0)
+        self.arm.set_state(state=0)
+        self.get_logger().info("✅ Direct SDK Connected & Armed.")
+
+        # 2. Communication
         self.vision_sub = self.create_subscription(String, '/vision/agent_state', self.vision_callback, 10)
         self.bin_sub = self.create_subscription(String, '/vision/bin_coordinates', self.bin_callback, 10)
         self.tool_pub = self.create_publisher(Int8, '/tool_cmd', 10)
+        self.state_pub = self.create_publisher(String, '/robot_state/tool_arm/update', 10)
+        self.send_tool_cmd(0) # Start Neutral
         self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
         
+        # 3. Memory
         self.data_lock = threading.Lock()
         self.latest_screw_targets = []
         self.latest_local_data = None
+        self.latest_full_data = {}
         self.latest_bin_coords = {} 
         self.ft_force = {'x': 0.0, 'y': 0.0, 'z': 0.0}
-        
-        # 👈 [NEW] Cache for Bin Location
         self.cached_bin_pose = None 
+        self.vision_msg_count = 0
+        self.last_sync_count = 0
+
+        # =====================================================================
+        # CONFIGURATION VARIABLES (Fine-Tune these)
+        # =====================================================================
+        self.SDK_MIN_SPEED = 30.0           # mm/s
+        self.SDK_MOVE_SPEED = 30.0          # mm/s for hops
+        self.SDK_SLOW_SPEED = 15.0          # mm/s for seating/contact? Use 26 for safety if needed.
+        self.SDK_RETRACT_SPEED = 50.0       # Fast retract for departures (mm/s)
         
-        # --- CONFIG ---
-        self.WORKSPACE_LIMITS = {'min_x': 0.780, 'max_x': 1.100, 'min_y': -0.150, 'max_y': 0.310}
-        self.CAMERA_FRAME = 'camera_color_optical_frame'   
+        # XY ALIGNMENT
+        self.XY_MAX_STEP_MM = 0.5           # Allow larger steps if fast
+        self.XY_MIN_STEP_MM = 0.1           # Smaller min jump to prevent oscillation
+        self.XY_GAIN = 0.4                  # LOWER GAIN (0.4) to fix overshoot latency
+        self.MM_PER_PIXEL = 0.00013         # Calibration (1mm per px @ 1m)
+        self.ALIGN_TOLERANCE_PX = 5.0      # Lock-on tolerance
+        self.ALIGN_LOCKED_THRESHOLD_PX = 10.0 # Threshold for high-speed Z descent
+        self.DEADBAND_PX = 3.0              # Stop jitter
+        self.SDK_XY_MAX_SPEED = 1.0         # Max mapping (Large error)
+        self.SDK_XY_MIN_SPEED = 0.1         # Min mapping (Small error)
+        self.SDK_XY_ALIGN_SPEED = 0.1       # Default/Legacy speed
+
+        # FUNNEL DESCENT
+        self.FUNNEL_START_THRESH_PX = 50.0  # Only start Z descent below this error
+        self.Z_MAX_STEP_MM = 1.0            # 1mm descent per hop
+        self.Z_MIN_STEP_MM = 0.5            # 0.5mm descent when misaligned
+        
+        # SPIRAL SEARCH
+        self.SPIRAL_RING_GAP_MM = 1.0       # 2mm expansion per rotation
+        self.SPIRAL_STEP_LEN_MM = 1.0       # 5mm hop distance
+        self.SPIRAL_SPEED = 10.0            # Faster spiral speed mm/s
+        self.SPIRAL_TIMEOUT = 15.0          # 15s vision recovery timeout
+        
+        # CONTACT & SEATING
+        self.Z_FORCE_SPIKE_THRESH = 3.0     # N
+        self.SEAT_ROTATE_TIME = 1.0         # 1s seating rotation
+        self.SEAT_CHECK_TIME = 0.5          # 0.5s check rotation
+        self.WIGGLE_SPEED = 1.0             # 1mm/s as requested
+        self.WIGGLE_AMP_MM = 2.0            # 5mm wiggle as requested
+        self.WIGGLE_LOCK_THRESH = 1.0       # N (force required to confirm seat)
+        self.WIGGLE_PASS_MIN = 3            # Pass out of 4 (1-4)
+
+        # EXTRACTION
+        self.EXTRACTION_RELIEF_MM = 1.0     # 1mm hop up on force spike
+        self.EXTRACTION_FORCE_SPIKE = 0.5   # N spike during unscrew
+        self.EXTRACTION_DONE_TIMEOUT = 5.0  # 5s timeout as requested
+        
+        # FRAME MAPPING
         self.PLANNING_FRAME = 'world_world'
-        self.ROBOT_BASE_FRAME = 'xarm5_base_link'           
-        self.VISUALIZE_TF = True                           
-        self.MM_PER_PIXEL = 0.000130   
-        self.INVERT_X = False; self.INVERT_Y = False; self.SWAP_XY = True            
-        self.TOOL_LENGTH_XARM = 0.24   
-        self.APPROACH_HOVER_Z = 0.015  
-        self.APPROACH_SPEED = 30.0
-        self.TRANSIT_SAFE_LIFT = 0.030 
-        self.SUCCESS_RETRACT = 0.050   
+        self.CAMERA_FRAME = 'camera_color_optical_frame'
+        self.ROBOT_BASE_FRAME = 'xarm5_base_link'
+        self.SWAP_XY = True                 # Transformed vision err_x -> robot_y, etc.
+        self.INVERT_X = True
+        self.INVERT_Y = True
         
-        # --- [STEP RETRACT CONFIG] ---
-        self.STEP_RETRACT_COUNT = 5     
-        self.STEP_RETRACT_DIST = 0.001  
-        self.STEP_RETRACT_SPEED = 20.0  
-        self.STEP_RETRACT_PAUSE = 0.2   
+        # SAFETY HEIGHTS
+        self.BEFORE_TARGET_RETRACT = 0.050  # 50mm lift before approach
+        self.HOVER_Z_HEIGHT = 0.015         # 15mm hover above part
+        self.TOOL_LENGTH = 0.24             # 240mm Tool Offset
+        self.SUCCESS_RETRACT = 0.015        # 15mm slow retract after unscrew
+        self.VISION_SETTLE_TIME = 0.3        # 300ms to allow vision pipeline to refresh
+        # =====================================================================
+
+        self.get_logger().info("🛠️ Unscrew Skill: Scratch-Rewrite Initialized.")
+
+    # =========================================================================
+    # 1. CORE EXECUTION ENGINE
+    # =========================================================================
+    def execute_unscrew_command(self, part_id: int, label="", interactive=False):
+        self.publish_arm_state("MOVING")
+        self.get_logger().info(f"🔗 TARGET: {label} [ID: {part_id}]")
         
-        self.POST_GRAB_RETRACT = 0.020 
-        self.RETRY_RETRACT = 0.005
-        self.BIN_DROP_Z_OFFSET = 0.030 
-        self.XY_ALIGN_SPEED = 20.0; self.Z_STEP_DOWN_DIST = -0.002; self.Z_STEP_SPEED = 5.0        
-        self.WIGGLE_DIST = 0.002; self.BLIND_DROP_LIMIT = 1      
-        self.UNSCREW_RELIEF_STEP = 0.001; self.UNSCREW_SPIKE_THRESH = 0.3; self.UNSCREW_DONE_TIMEOUT = 3.0   
-        self.EXTRACTION_WIGGLE_AMP = 0.0015; self.EXTRACTION_WIGGLE_SPEED = 15.0 
-        self.APPROACH_COLLISION_THRESH = 3.0; self.SURFACE_CONTACT_THRESH = 2.0; self.WIGGLE_LOCK_THRESH = 3.5        
-        self.SPIRAL_STEPS = 20; self.SPIRAL_GAP = 0.002        
+        # 1. RETRACT 50mm BEFORE ANY MOVE
+        self.get_logger().info(f"⬆️ Safe Retract: {self.BEFORE_TARGET_RETRACT*1000}mm")
+        self._ensure_sdk_mode(0)
+        self.jog_absolute_dk(0, 0, self.BEFORE_TARGET_RETRACT*1000, speed=self.SDK_RETRACT_SPEED)
+
+        # 2. LOCATE TARGET IN WORLD
+        target_xyz = self.locate_part_in_world(part_id)
+        if not target_xyz:
+            self.send_tool_cmd(0)
+            self.publish_arm_state("ERROR")
+            return False
+
+        # 3. SDK HOVER APPROACH
+        world_x, world_y, surface_z = target_xyz
+        hover_flange_z = surface_z + self.TOOL_LENGTH + self.HOVER_Z_HEIGHT
+        
+        p = Pose()
+        p.position.x, p.position.y, p.position.z = world_x, world_y, hover_flange_z
+        p.orientation.w = 1.0
+        
+        trans_p = self.get_transformed_pose(p, self.PLANNING_FRAME, self.ROBOT_BASE_FRAME)
+        if not trans_p:
+            self.send_tool_cmd(0)
+            self.get_logger().error("❌ Failed to transform hover pose to base frame.")
+            self.publish_arm_state("ERROR")
+            return False
+            
+        tx = trans_p.pose.position.x * 1000.0
+        ty = trans_p.pose.position.y * 1000.0
+        tz = trans_p.pose.position.z * 1000.0
+        
+        self.get_logger().info(f"🛰️ SDK Planning to Hover: X:{tx:.1f} Y:{ty:.1f} Z:{tz:.1f}...")
+        self._ensure_sdk_mode(0)
+        
+        # Fast transit to hover using retract speed
+        move_code = self.arm.set_position(x=tx, y=ty, z=tz, roll=180, pitch=0, yaw=0, speed=self.SDK_RETRACT_SPEED, wait=True)
+        if move_code != 0:
+            self.send_tool_cmd(0)
+            self.get_logger().error("❌ SDK Hover move failed.")
+            self.publish_arm_state("ERROR")
+            return False
+
+        # 4. START ALIGNMENT & DESCENT (Direct SDK)
+        self.publish_arm_state("UNSCREWING")
+        seated = self.sdk_staircase_descent(interactive)
+        
+        if seated == "HOLE_ONLY":
+            self.get_logger().info("⏹️ Hole found. Navigating to Bin 1 directly.")
+            self.dispose_to_bin("bin_1")
+            return True
+            
+        if not seated:
+            self.send_tool_cmd(0)
+            self.get_logger().error("❌ Failed to seat bit.")
+            self.publish_arm_state("ERROR")
+            return False
+
+        # 5. UNSCREWING PROCESS
+        self.publish_arm_state("UNSCREWING")
+        self.sdk_reactive_extraction(interactive)
+
+        # 6. DISPOSE
+        self.dispose_to_bin("bin_1")
+        return True
+
+    # =========================================================================
+    # 2. SDK STAIRCASE & SPIRAL (The Deep Logic)
+    # =========================================================================
+    def sdk_staircase_descent(self, interactive=False):
+        self.get_logger().info("🔍 Starting SDK Funnel Alignment...")
+        self._ensure_sdk_mode(0)
+        
+        # Initialize baselines
+        bx, by, bz = self.get_fresh_ft()
+        spiral_start_t = None
+        spiral_cnt = 0
+        
+        # Check if we should start with spiral (Hole Only logic)
+        with self.data_lock:
+            local = copy.deepcopy(self.latest_local_data)
+        if local and local.get("holes") and not local.get("screw_heads"):
+            self.get_logger().info("🕳️ Only Hole detected. Starting direct Hole Spiral Search...")
+            res = self.sdk_spiral_loop()
+            if res == "TIMEOUT": return "HOLE_ONLY"
+            # If spiral found a screw, continue
+
+        while rclpy.ok():
+            # 1. Contact Monitoring (Global Surface Detection)
+            _, _, curr_z = self.get_fresh_ft()
+            spike = abs(curr_z - bz)
+            if spike > self.Z_FORCE_SPIKE_THRESH:
+                self.get_logger().info(f"🎯 [SURFACE CONTACT] Z-Spike: {spike:.2f}N. Verifying bit seat...")
+                
+                # User: "when z force / surface contact detected do a quick unscrew of 0.5 sec just to check... than do wiggle test"
+                self.send_tool_cmd(-1)
+                time.sleep(0.5)
+                self.send_tool_cmd(0)
+                time.sleep(0.5)
+                
+                if self.sdk_wiggle_check():
+                    self.publish_arm_state("UNSCREWING_COMPLETE")
+                    return True
+                else:
+                    self.publish_arm_state("UNSCREWING_RETRY")
+                    self.get_logger().warn("⚠️ Wiggle failed. Retrying descent...")
+                    self.jog_absolute_dk(0, 0, 5.0, speed=self.SDK_RETRACT_SPEED) # Faster retract
+                    bz = self.get_fresh_ft()[2] # Re-zero
+                    continue
+
+            # 2. Vision Check
+            err_x, err_y, dist_px = self.get_target_pixel_error()
+            
+            if err_x is None:
+                # Vision lost -> Spiral Search
+                self.get_logger().warn("⚠️ Vision lost! Entering Spiral Recovery...")
+                res = self.sdk_spiral_loop()
+                if res == "TIMEOUT":
+                    return "HOLE_ONLY"
+                elif res == "CONTACT":
+                    # Force a contact cycle in the next loop iteration
+                    continue
+                continue
+
+            # 3. Calculate XY Jump
+            # Map pixels to robot meters
+            raw_dx = (err_y * self.MM_PER_PIXEL) * self.XY_GAIN if self.SWAP_XY else (err_x * self.MM_PER_PIXEL) * self.XY_GAIN
+            raw_dy = (err_x * self.MM_PER_PIXEL) * self.XY_GAIN if self.SWAP_XY else (err_y * self.MM_PER_PIXEL) * self.XY_GAIN
+            
+            if self.INVERT_X: raw_dx = -raw_dx
+            if self.INVERT_Y: raw_dy = -raw_dy
+            
+            # Clamp Step size (mm)
+            dx_mm = self.clamp_step(raw_dx * 1000.0, self.XY_MIN_STEP_MM, self.XY_MAX_STEP_MM)
+            dy_mm = self.clamp_step(raw_dy * 1000.0, self.XY_MIN_STEP_MM, self.XY_MAX_STEP_MM)
+            
+            # Apply deadband
+            if dist_px < self.DEADBAND_PX: dx_mm = 0.0; dy_mm = 0.0
+
+            # 4. Calculate Z Descent (Funnel)
+            dz_mm = 0.0
+            if dist_px < self.FUNNEL_START_THRESH_PX:
+                # User instructions: "close it it to the target higher the step size"
+                # If error < 10px -> 1.0mm, if error > 20px -> 0.5mm
+                if dist_px < self.ALIGN_LOCKED_THRESHOLD_PX:
+                    dz_mm = -self.Z_MAX_STEP_MM
+                else:
+                    dz_mm = -self.Z_MIN_STEP_MM
+            
+            # 5. Execute Command with Dynamic Speed
+            # Less error -> Less speed.
+            dyn_speed = max(self.SDK_XY_MIN_SPEED, min(self.SDK_XY_MAX_SPEED, (dist_px / 30.0) * self.SDK_XY_MAX_SPEED))
+            
+            self.get_logger().info(f"📉 Err:{dist_px:.1f}px | dX:{dx_mm:.2f} dY:{dy_mm:.2f} dZ:{dz_mm:.2f} Spd:{dyn_speed:.2f}")
+            self.jog_absolute_dk(dx_mm, dy_mm, dz_mm, speed=dyn_speed)
+            
+            # Anti-Overshoot Sync: Wait for fresh frames (usually 2 msgs to clear buffer)
+            self.wait_for_vision_update(count=2)
+            time.sleep(self.VISION_SETTLE_TIME)
+            
+        return False
+
+    def sdk_spiral_loop(self):
+        """Archimedean spiral hop loop with force monitoring."""
+        start_t = time.time()
+        idx = 0
+        _, _, bz = self.get_fresh_ft()
+        
+        while (time.time() - start_t) < self.SPIRAL_TIMEOUT:
+            # Check Force Spike (Surface Detection during spiral)
+            _, _, cz = self.get_fresh_ft()
+            if abs(cz - bz) > self.Z_FORCE_SPIKE_THRESH:
+                self.get_logger().info(f"🎯 [SPIRAL CONTACT] Z-Spike: {abs(cz-bz):.2f}N")
+                return "CONTACT"
+
+            idx += 1
+            # Archimedean math: r = a * theta
+            # Ring gap 1mm -> 0.001m
+            theta = idx * 0.5 # radians per step
+            r = theta * ((self.SPIRAL_RING_GAP_MM / 1000.0) / (2 * math.pi))
+            
+            p_theta = (idx - 1) * 0.5
+            p_r = p_theta * ((self.SPIRAL_RING_GAP_MM / 1000.0) / (2 * math.pi))
+            
+            # Step in robot space
+            delta_x = (r * math.cos(theta)) - (p_r * math.cos(p_theta))
+            delta_y = (r * math.sin(theta)) - (p_r * math.sin(p_theta))
+            
+            # User wants 1mm steps
+            dx_mm = delta_x * 1000.0
+            dy_mm = delta_y * 1000.0
+            
+            # Scale to user's requirement
+            scale = self.SPIRAL_STEP_LEN_MM / math.hypot(dx_mm, dy_mm)
+            dx_mm *= scale; dy_mm *= scale
+            
+            self.get_logger().info(f"🌀 Spiral hop {idx} | dX:{dx_mm:.2f} dY:{dy_mm:.2f} Spd:{self.SPIRAL_SPEED}")
+            
+            # Map axes for spiral
+            raw_dx = dy_mm if self.SWAP_XY else dx_mm
+            raw_dy = dx_mm if self.SWAP_XY else dy_mm
+            if self.INVERT_X: raw_dx = -raw_dx
+            if self.INVERT_Y: raw_dy = -raw_dy
+
+            self.jog_absolute_dk(raw_dx, raw_dy, 0, speed=self.SPIRAL_SPEED)
+            time.sleep(0.1)
+            
+            if self.get_target_pixel_error()[0] is not None:
+                self.get_logger().info("✅ Vision Recovered!")
+                return "FOUND"
+                
+        return "TIMEOUT"
+
+    def sdk_wiggle_check(self):
+        """Perform 4-way force barrier check with detailed UI states."""
+        self.get_logger().info(f"🔄 Performing 3/4 Wiggle Pass ({self.WIGGLE_AMP_MM}mm Hops)...")
+        passes = 0
+        amp = self.WIGGLE_AMP_MM
+        
+        # Directions: List of (dx, dy, axis_index, label)
+        directions = [
+            (amp, 0, 0, "WIGGLE_POS_X"),
+            (-amp, 0, 0, "WIGGLE_NEG_X"),
+            (0, amp, 1, "WIGGLE_POS_Y"),
+            (0, -amp, 1, "WIGGLE_NEG_Y")
+        ]
+        
+        self._ensure_sdk_mode(0)
+        
+        for dx, dy, axis_idx, label in directions:
+            self.publish_arm_state(label) # Show in UI one by one
+            baselines = self.get_fresh_ft()
+            bx, by = baselines[0], baselines[1]
+            
+            # Wiggle at 1mm/s for 5mm
+            self.jog_absolute_dk(dx, dy, 0, speed=self.WIGGLE_SPEED)
+            time.sleep(0.15)
+            
+            currents = self.get_fresh_ft()
+            cx, cy = currents[0], currents[1]
+            
+            spike = abs(cx - bx) if axis_idx == 0 else abs(cy - by)
+            self.get_logger().info(f"   [{label}] Spike:{spike:.2f}N")
+                
+            if spike > 1.0: # 1.0N spike threshold
+                passes += 1
+            
+            # Return to center
+            self.jog_absolute_dk(-dx, -dy, 0, speed=self.WIGGLE_SPEED)
+            time.sleep(0.1)
+            
+        success = passes >= 3
+        self.get_logger().info(f"📊 Wiggle result: {passes}/4. {'PASS' if success else 'FAIL'}")
+        return success
+
+    def sdk_reactive_extraction(self, interactive=False):
+        """Unscrew with relief hops on force spikes."""
+        self.get_logger().info("🔥 Starting Unscrewing Force Compliance...")
+        bx, by, bz = self.get_fresh_ft()
+        
+        # User: "send -1... always before starting to unscrew"
+        self.send_tool_cmd(-1) 
+        time.sleep(0.2)
+        
+        # User: "while unscrew grab the screw as well"
+        self.send_tool_cmd(2) 
+        time.sleep(0.5)
+        
+        last_spike_t = time.time()
+        while rclpy.ok():
+            _, _, cz = self.get_fresh_ft()
+            spike = abs(cz - bz) # Use absolute spike to handle rising force correctly
+            
+            if spike > self.EXTRACTION_FORCE_SPIKE:
+                self.get_logger().info(f"📈 Screw rising! Relief hop: {self.EXTRACTION_RELIEF_MM}mm (Spike: {spike:.2f}N)")
+                self.jog_absolute_dk(0, 0, self.EXTRACTION_RELIEF_MM)
+                # Re-baseline slightly higher
+                bx, by, bz = self.get_fresh_ft()
+                last_spike_t = time.time()
+            
+            if (time.time() - last_spike_t) > self.EXTRACTION_DONE_TIMEOUT:
+                self.get_logger().info("✅ Force stabilized. Unscrew complete.")
+                break
+            time.sleep(0.05)
+            
+        self.send_tool_cmd(0) # Stop motor
+        time.sleep(0.5)
+        
+        # SLOW 15mm RETRACT
+        self.get_logger().info(f"⬆️ Slow Retract: {self.SUCCESS_RETRACT*1000}mm")
+        self.jog_absolute_dk(0, 0, self.SUCCESS_RETRACT*1000)
+
+    def dispose_to_bin(self, bin_name="bin_1"):
+        """SDK-based bin disposal to follow 'MoveIt only for hover' rule."""
+        self.publish_arm_state("MOVING")
+        self.get_logger().info(f"🗑️ Navigating to {bin_name}...")
+        
+        # 0. Lift 50mm before transit
+        self.jog_absolute_dk(0, 0, self.BEFORE_TARGET_RETRACT*1000, speed=self.SDK_RETRACT_SPEED)
+        
+        bin_xyz = self.calculate_bin_pose(bin_name)
+        if not bin_xyz:
+            self.get_logger().error(f"❌ {bin_name} coords unknown.")
+            return False
+            
+        wx, wy, wz = bin_xyz
+        target_z = wz + self.TOOL_LENGTH + 0.050 # Drop 50mm above bin surface
+        
+        # Convert World (wx, wy, target_z) to Robot Base Frame
+        p = Pose()
+        p.position.x, p.position.y, p.position.z = wx, wy, target_z
+        p.orientation.w = 1.0
+        
+        trans_p = self.get_transformed_pose(p, self.PLANNING_FRAME, self.ROBOT_BASE_FRAME)
+        if not trans_p:
+            self.get_logger().error("❌ Failed to transform bin pose to base frame.")
+            return False
+            
+        tx, ty, tz = trans_p.pose.position.x * 1000.0, trans_p.pose.position.y * 1000.0, trans_p.pose.position.z * 1000.0
+        
+        # Absolute SDK move to bin
+        self._ensure_sdk_mode(0)
+        self.get_logger().info(f"🚚 SDK Move to Bin: X:{tx:.1f} Y:{ty:.1f} Z:{tz:.1f}")
+        self.arm.set_position(tx, ty, tz, 180, 0, 0, speed=50.0, wait=True)
+        
+        self.get_logger().info(f"👐 Dropping screw in {bin_name}...")
+        self.publish_arm_state("DROPPING")
+        
+        # User: "send 0 to stop the unscrew and after that 3 to open"
+        self.send_tool_cmd(0)
+        time.sleep(0.2)
+        self.send_tool_cmd(3) 
+        time.sleep(1.5)
+        self.send_tool_cmd(0)
+        
+        # Retract 50mm after drop
+        self.jog_absolute_dk(0, 0, self.BEFORE_TARGET_RETRACT*1000, speed=self.SDK_RETRACT_SPEED)
+        self.publish_arm_state("IDLE")
+        return True
+
+    # =========================================================================
+    # 3. TRANSFORMATION & VISION
+    # =========================================================================
+    def locate_part_in_world(self, part_id):
+        target_data = None
+        wait_start = time.time()
+        while rclpy.ok() and (time.time() - wait_start) < 5.0:
+            with self.data_lock:
+                for part in self.latest_screw_targets:
+                    if part['id'] == part_id: target_data = copy.deepcopy(part); break
+            if target_data: break
+            time.sleep(0.5)
+        if not target_data: return None
+
+        # Pixel-to-World Transform
+        p = Pose()
+        p.position.x, p.position.y, p.position.z = target_data['xyz']
+        p.orientation.w = 1.0
+        
+        # Average 5 samples
+        valid_x, valid_y, valid_z = [], [], []
+        for _ in range(5):
+            t = self.get_transformed_pose(p, self.CAMERA_FRAME, self.PLANNING_FRAME)
+            if t:
+                valid_x.append(t.pose.position.x)
+                valid_y.append(t.pose.position.y)
+                valid_z.append(t.pose.position.z)
+            time.sleep(0.05)
+        
+        return (np.median(valid_x), np.median(valid_y), np.median(valid_z)) if valid_x else None
+
+    def get_target_pixel_error(self):
+        with self.data_lock:
+            local = copy.deepcopy(self.latest_local_data)
+        if not local or not local.get("screw_heads"):
+            return None, None, None
+        
+        # Use center of best screw bounding box
+        best = max(local["screw_heads"], key=lambda x: x.get("conf", 0))
+        box = best.get("box")
+        cx = int((box[0] + box[2]) / 2)
+        cy = int((box[1] + box[3]) / 2)
+        
+        # Crosshair center (usually 320, 240)
+        ch = local.get("crosshair", [320, 240])
+        err_x = ch[0] - cx
+        err_y = ch[1] - cy
+        return err_x, err_y, math.hypot(err_x, err_y)
+
+    # =========================================================================
+    # 4. LOW-LEVEL SDK JOGGERS (The "Scratch" part)
+    # =========================================================================
+    def _ensure_sdk_mode(self, mode=0):
+        self.arm.clean_error()
+        self.arm.motion_enable(True)
+        self.arm.set_mode(mode)
+        self.arm.set_state(0)
+        time.sleep(0.1)
+
+    def jog_absolute_dk(self, dx_mm, dy_mm, dz_mm, speed=None):
+        """Calculate absolute target from current joint positions and command absolute move."""
+        code, curr_pos = self.arm.get_position(is_radian=False)
+        if code != 0: return False
+        
+        tx = curr_pos[0] + dx_mm
+        ty = curr_pos[1] + dy_mm
+        tz = curr_pos[2] + dz_mm
+        
+        cmd_speed = speed if speed is not None else self.SDK_XY_ALIGN_SPEED
+
+        # Use wait=True for precise blocking steps
+        self.arm.set_position(x=tx, y=ty, z=tz, roll=curr_pos[3], pitch=curr_pos[4], yaw=curr_pos[5],
+                              speed=cmd_speed, wait=True)
+        return True
+
+    def get_fresh_ft(self):
+        with self.data_lock:
+            return self.ft_force['x'], self.ft_force['y'], self.ft_force['z']
+
+    # =========================================================================
+    # HELPERS
+    # =========================================================================
+    def clamp_step(self, val, min_s, max_s):
+        if abs(val) < 0.001: return 0.0
+        sign = 1.0 if val >= 0 else -1.0
+        return sign * max(min_s, min(abs(val), max_s))
+
+    def publish_arm_state(self, state):
+        msg = String(); msg.data = state.upper(); self.state_pub.publish(msg)
 
     def bin_callback(self, msg):
         try:
             data = json.loads(msg.data.strip("'"))
-            with self.data_lock: 
-                self.latest_bin_coords = data
+            with self.data_lock: self.latest_bin_coords = data
         except Exception: pass
 
     def vision_callback(self, msg):
+        self.vision_msg_count += 1
         try:
             data = json.loads(msg.data.strip("'"))
             objects = data.get("global_view", {}).get("objects", [])
@@ -83,6 +571,7 @@ class UnscrewSkill(Node):
             with self.data_lock:
                 self.latest_screw_targets = new_targets
                 self.latest_local_data = data.get("local_view", {})
+                self.latest_full_data = data
                 ft = data.get("force_torque", {}).get("force", {})
                 self.ft_force = {'x': ft.get("x", 0.0), 'y': ft.get("y", 0.0), 'z': ft.get("z", 0.0)}
         except Exception: pass 
@@ -90,259 +579,79 @@ class UnscrewSkill(Node):
     def send_tool_cmd(self, val):
         msg = Int8(); msg.data = int(val); self.tool_pub.publish(msg)
 
-    def get_fresh_baselines(self, settle_time=0.2):
-        time.sleep(settle_time)
-        with self.data_lock: return self.ft_force['x'], self.ft_force['y'], self.ft_force['z']
+    def wait_for_vision_update(self, count=2, timeout=2.0):
+        """Wait for n new messages to arrive to ensure we aren't using stale frames."""
+        start_count = self.vision_msg_count
+        start_t = time.time()
+        while rclpy.ok() and (self.vision_msg_count - start_count) < count:
+            if (time.time() - start_t) > timeout: break
+            time.sleep(0.01)
 
-    def get_fresh_vision_error(self):
-        with self.data_lock: self.latest_local_data = None 
-        wait_start = time.time()
-        while rclpy.ok() and (time.time() - wait_start) < 2.0:
-            with self.data_lock:
-                if self.latest_local_data:
-                    screws, tools = self.latest_local_data.get("screw_heads", []), self.latest_local_data.get("tool_tips", [])
-                    if screws and tools:
-                        t, s = max(tools, key=lambda x: x.get("conf", 0)), max(screws, key=lambda x: x.get("conf", 0))
-                        tx, ty = t.get("contact_point", [None, None]); sx, sy = s.get("center", [None, None])
-                        if None not in [tx, ty, sx, sy]: return (sx - tx), (sy - ty)
-            time.sleep(0.1)
-        return None, None
+    def calculate_bin_pose(self, name="bin_1"):
+        if self.cached_bin_pose: return self.cached_bin_pose
+        with self.data_lock: data = self.latest_bin_coords.get(name)
+        if not data: return None
+        p = Pose()
+        p.position.x, p.position.y, p.position.z = data['xyz']
+        p.orientation.w = 1.0
+        res = self.locate_part_in_world_from_pose(p)
+        if res: self.cached_bin_pose = res
+        return res
 
-    def detect_hole_anomaly(self):
-        with self.data_lock:
-            if self.latest_local_data:
-                screws = self.latest_local_data.get("screw_heads", [])
-                holes = self.latest_local_data.get("holes", []) or self.latest_local_data.get("empty_holes", [])
-                if holes and not screws: return True
-        return False
-
-    def get_current_tcp_position(self):
-        try:
-            t = self.moveit_backend.tf_buffer.lookup_transform(self.PLANNING_FRAME, 'xarm5_link5', rclpy.time.Time())
-            return t.transform.translation.x, t.transform.translation.y, t.transform.translation.z
-        except Exception: return None
-
-    def validate_workspace_bounds(self, x, y):
-        if (x < self.WORKSPACE_LIMITS['min_x'] or x > self.WORKSPACE_LIMITS['max_x']): return False, "X Out"
-        if (y < self.WORKSPACE_LIMITS['min_y'] or y > self.WORKSPACE_LIMITS['max_y']): return False, "Y Out"
-        return True, "Safe"
-
-    def get_averaged_target_pose(self, source_pose, samples=5):
+    def locate_part_in_world_from_pose(self, p):
         valid_x, valid_y, valid_z = [], [], []
-        for _ in range(samples):
-            target_stamped = self.moveit_backend.get_transformed_pose(source_pose, self.CAMERA_FRAME, self.PLANNING_FRAME)
-            if target_stamped:
-                vx, vy, vz = target_stamped.pose.position.x, target_stamped.pose.position.y, target_stamped.pose.position.z
-                if abs(vx) > 0.001: valid_x.append(vx); valid_y.append(vy); valid_z.append(vz)
-            time.sleep(0.05) 
-        return (np.median(valid_x), np.median(valid_y), np.median(valid_z)) if valid_x else None
-
-    def calculate_bin_pose(self, bin_name="bin_1"):
-        """
-        [FIXED] Implements caching logic. Only looks for the bin if it hasn't been found yet.
-        """
-        if self.cached_bin_pose is not None:
-            return self.cached_bin_pose
-
-        print(f"   🔍 Scanning for {bin_name} coordinates to cache...")
-        with self.data_lock: bin_data = self.latest_bin_coords.get(bin_name)
-        if not bin_data: return None
-
-        source_pose = Pose()
-        source_pose.position.x, source_pose.position.y, source_pose.position.z = bin_data['xyz']
-        source_pose.orientation.w = 1.0
-        
-        res = self.get_averaged_target_pose(source_pose, samples=10) # 10 samples for high accuracy bin pose
-        if res:
-            self.cached_bin_pose = res
-            print(f"   ✅ Bin Cached at: {res}")
-            return res
-        return None
-
-    def execute_unscrew_command(self, target_id: int, target_label="", interactive=True):
-        print(f"\n🛠️ [START] ID: {target_id}"); target_data = None; wait_start = time.time()
-        while rclpy.ok() and (time.time() - wait_start) < 5.0:
-            with self.data_lock:
-                for part in self.latest_screw_targets:
-                    if part['id'] == target_id: target_data = copy.deepcopy(part); break
-            if target_data: break
-            time.sleep(0.5)
-        return self._unscrew_state_machine(target_data, interactive) if target_data else False
-
-    def _unscrew_state_machine(self, part_data, interactive=True):
-        self.send_tool_cmd(0); time.sleep(0.2); self.send_tool_cmd(3); time.sleep(0.2)
-        
-        # 👈 [NEW] Pre-fetch bin coordinates at the start if not already cached
-        self.calculate_bin_pose("bin_1")
-
-        source_pose = Pose()
-        source_pose.position.x, source_pose.position.y, source_pose.position.z = part_data['xyz']
-        source_pose.orientation.w = 1.0
-        target_xyz = self.get_averaged_target_pose(source_pose)
-        if not target_xyz: return False
-        world_x, world_y, screw_surface_z = target_xyz
-        is_safe, _ = self.validate_workspace_bounds(world_x, world_y)
-        if not is_safe:
-            if input("🛑 OUT OF BOUNDS! SKIP? (y/n): ").lower() == 'y': return False
-        
-        if interactive: input(f"👉 GATE 1: Approach? ")
-        if not self.guarded_approach(world_x, world_y, screw_surface_z): return False 
-        
-        if interactive: input(f"👉 GATE 2: Arrived. Start Staircase? ")
-        for _ in range(3):
-            if not self.staircase_align_and_descend(interactive=interactive): return False 
-            if self.verify_seating():
-                self.reactive_unscrew(interactive)
-                self.dispose_screw("bin_1")
-                return True 
-            else: self.moveit_backend.jog_cartesian_sdk(0, 0, self.RETRY_RETRACT, speed_mm_s=20.0)
-        return False
-
-    def guarded_approach(self, x, y, screw_surface_z):
-        self.moveit_backend.jog_cartesian_sdk(0, 0, self.TRANSIT_SAFE_LIFT, speed_mm_s=50.0)
-        target_flange_z = screw_surface_z + self.TOOL_LENGTH_XARM + self.APPROACH_HOVER_Z
-        success = self.moveit_backend.move_to_pose_robust(x, y, target_flange_z, {}, link_name="xarm5_link5", velocity=0.2)
-        if not success:
-            w_pose = Pose(); w_pose.position.x, w_pose.position.y, w_pose.position.z, w_pose.orientation.w = x, y, screw_surface_z, 1.0
-            b_pose = self.moveit_backend.get_transformed_pose(w_pose, self.PLANNING_FRAME, self.ROBOT_BASE_FRAME)
-            if b_pose:
-                bz_flange = b_pose.pose.position.z + self.TOOL_LENGTH_XARM + self.APPROACH_HOVER_Z
-                success = self.moveit_backend.move_to_absolute_pose_sdk(b_pose.pose.position.x, b_pose.pose.position.y, bz_flange, speed_mm_s=50.0)
-        return success
-
-    def staircase_align_and_descend(self, interactive=True):
-        step_count, blind_steps_consecutive = 0, 0 
-        while rclpy.ok():
-            step_count += 1
-            if self.detect_hole_anomaly():
-                if interactive:
-                    if input(f"      🕳️ [VISION] Hole Detected! skip part? (y/n): ").lower() == 'y': return False 
-                else: return False
-
-            aligned = False; is_first = True 
-            while not aligned and rclpy.ok():
-                err_u, err_v = self.get_fresh_vision_error()
-                if err_u is None:
-                    if blind_steps_consecutive < self.BLIND_DROP_LIMIT:
-                        blind_steps_consecutive += 1; aligned = True; break
-                    else:
-                        self.run_visual_spiral(); is_first = True 
-                        if self.get_fresh_vision_error()[0]: blind_steps_consecutive = 0 
-                        continue
-                else: blind_steps_consecutive = 0 
-                    
-                dist_px = math.sqrt(err_u**2 + err_v**2)
-                if dist_px < 5.0: aligned = True; break
-                
-                raw_dx = (err_v if self.SWAP_XY else err_u) * self.MM_PER_PIXEL
-                raw_dy = (err_u if self.SWAP_XY else err_v) * self.MM_PER_PIXEL
-                dx_m, dy_m = (-raw_dx if self.INVERT_X else raw_dx), (-raw_dy if self.INVERT_Y else raw_dy)
-                
-                max_step = 0.001 if is_first else 0.0005
-                move_dist = math.hypot(dx_m, dy_m)
-                if move_dist > max_step:
-                    scale = max_step / move_dist
-                    dx_m *= scale; dy_m *= scale
-                self.moveit_backend.jog_cartesian_sdk(dx_m, dy_m, 0.0, speed_mm_s=self.XY_ALIGN_SPEED)
-                is_first = False 
-
-            bx, _, bz = self.get_fresh_baselines(0.2)
-            self.moveit_backend.jog_cartesian_sdk(0, 0, self.Z_STEP_DOWN_DIST, speed_mm_s=self.Z_STEP_SPEED)
-            if abs(self.get_fresh_baselines(0.2)[2] - bz) > self.SURFACE_CONTACT_THRESH: return True
-        return False
-
-    def verify_seating(self):
-        print("   🔄 Wiggle Check..."); self.send_tool_cmd(1); time.sleep(0.3); self.send_tool_cmd(0); time.sleep(0.5)
-        locks = 0
-        for dx, dy in [(self.WIGGLE_DIST, 0), (-self.WIGGLE_DIST*2, 0), (self.WIGGLE_DIST, 0), (0, self.WIGGLE_DIST), (0, -self.WIGGLE_DIST*2), (0, self.WIGGLE_DIST)]:
-            if hasattr(self.moveit_backend, 'arm'): self.moveit_backend.arm.clean_error(); self.moveit_backend.arm.motion_enable(True); self.moveit_backend.arm.set_state(0)
-            bx, by, _ = self.get_fresh_baselines(0.2)
-            self.moveit_backend.jog_cartesian_sdk(dx, dy, 0.0, speed_mm_s=self.Z_STEP_SPEED)
-            cx, cy, _ = self.get_fresh_baselines(0.1)
-            if math.sqrt((cx-bx)**2 + (cy-by)**2) > self.WIGGLE_LOCK_THRESH: locks += 1
-        return locks >= 3
-
-    def reactive_unscrew(self, interactive=True):
-        bx, by, bz = self.get_fresh_baselines(0.5); self.send_tool_cmd(-1); last_spike = time.time()
-        while rclpy.ok():
-            spike = self.ft_force['z'] - bz
-            if spike > self.UNSCREW_SPIKE_THRESH:
-                self.moveit_backend.jog_cartesian_sdk(0, 0, self.UNSCREW_RELIEF_STEP, speed_mm_s=self.Z_STEP_SPEED)
-                bx, by, bz = self.get_fresh_baselines(0.1); last_spike = time.time()
-            elif (time.time() - last_spike) > self.UNSCREW_DONE_TIMEOUT: break
+        for _ in range(5):
+            t = self.get_transformed_pose(p, self.CAMERA_FRAME, self.PLANNING_FRAME)
+            if t:
+                valid_x.append(t.pose.position.x)
+                valid_y.append(t.pose.position.y)
+                valid_z.append(t.pose.position.z)
             time.sleep(0.05)
-            
-        self.send_tool_cmd(0)
-        print("   🤏 [EXTRACT] Initializing GRAB...")
-        self.send_tool_cmd(2)
-        time.sleep(0.8)
+        if not valid_x: return None
+        return (np.median(valid_x), np.median(valid_y), np.median(valid_z))
 
-        print(f"   🪜 [EXTRACT] Starting Step Retract...")
-        for i in range(self.STEP_RETRACT_COUNT):
-            time.sleep(self.STEP_RETRACT_PAUSE)
-            self.moveit_backend.jog_cartesian_sdk(0, 0, self.STEP_RETRACT_DIST, speed_mm_s=self.STEP_RETRACT_SPEED)
-        
-        if interactive: input(f"\n👉 GATE 4: Step Retract Complete. ENTER to Wiggle: ")
-        self.perform_post_grab_wiggle()
-        self.moveit_backend.jog_cartesian_sdk(0, 0, self.POST_GRAB_RETRACT, speed_mm_s=20.0)
+    def get_transformed_pose(self, source_pose, source_frame: str, target_frame: str):
+        from geometry_msgs.msg import PoseStamped
+        import tf2_geometry_msgs
+        try:
+            real_pose = source_pose.pose if hasattr(source_pose, 'pose') else source_pose
+            p = PoseStamped()
+            p.header.frame_id = source_frame
+            p.header.stamp = rclpy.time.Time().to_msg()
+            p.pose = real_pose
 
-    def perform_post_grab_wiggle(self):
-        amp, spd = self.EXTRACTION_WIGGLE_AMP, self.EXTRACTION_WIGGLE_SPEED
-        for dx, dy in [(amp, 0), (-amp*2, 0), (amp, 0), (0, amp), (0, -amp*2), (0, amp)]:
-            self.moveit_backend.jog_cartesian_sdk(dx, dy, 0, speed_mm_s=spd)
-
-    def dispose_screw(self, bin_name="bin_1"):
-        """
-        [FIXED] Uses cached bin coordinate to ensure the robot never fails to find the bin.
-        """
-        bin_xyz = self.calculate_bin_pose(bin_name)
-        if not bin_xyz:
-            print(f"   ❌ [ERROR] {bin_name} was never found/cached. Releasing locally.")
-            self.send_tool_cmd(3); return False
-        
-        wx, wy, bz = bin_xyz
-        target_flange_z = bz + self.TOOL_LENGTH_XARM + self.BIN_DROP_Z_OFFSET
-        
-        print(f"   🗑️ [PHASE 5] Disposing in {bin_name} at X:{wx:.3f} Y:{wy:.3f}...")
-        
-        if not self.moveit_backend.move_to_pose_robust(wx, wy, target_flange_z, {}, link_name="xarm5_link5", velocity=0.2):
-            # SDK Fallback with cached coordinates
-            w_pose = Pose(); w_pose.position.x, w_pose.position.y, w_pose.position.z, w_pose.orientation.w = wx, wy, bz, 1.0
-            b_pose = self.moveit_backend.get_transformed_pose(w_pose, self.PLANNING_FRAME, self.ROBOT_BASE_FRAME)
-            if b_pose:
-                self.moveit_backend.move_to_absolute_pose_sdk(b_pose.pose.position.x, b_pose.pose.position.y, b_pose.pose.position.z + self.TOOL_LENGTH_XARM + self.BIN_DROP_Z_OFFSET, speed_mm_s=50.0)
-        
-        self.send_tool_cmd(3); time.sleep(0.5); self.moveit_backend.jog_cartesian_sdk(0, 0, self.SUCCESS_RETRACT, speed_mm_s=20.0)
-        return True
-
-    def run_visual_spiral(self):
-        dirs = [[0, -1], [-1, 0], [0, 1], [1, 0]]; leg, gap_mult = 0, 1
-        while leg < self.SPIRAL_STEPS and rclpy.ok():
-            if leg > 0 and leg % 2 == 0: gap_mult += 1
-            dx, dy = dirs[leg%4][0] * self.SPIRAL_GAP * gap_mult, dirs[leg%4][1] * self.SPIRAL_GAP * gap_mult
-            if self.SWAP_XY: dx, dy = dy, dx
-            if self.INVERT_X: dx = -dx
-            if self.INVERT_Y: dy = -dy
-            self.moveit_backend.jog_cartesian_sdk(dx, dy, 0.0, speed_mm_s=self.XY_ALIGN_SPEED)
-            if self.get_fresh_vision_error()[0]: return True
-            leg += 1
-        return False
+            if not self.tf_buffer.can_transform(target_frame, source_frame, rclpy.time.Time(),
+                                                 timeout=rclpy.duration.Duration(seconds=1.0)):
+                return None
+            t = self.tf_buffer.transform(p, target_frame)
+            return t
+        except Exception as e:
+            self.get_logger().error(f"TF Error: {e}")
+            return None
 
 def main(args=None):
-    rclpy.init(args=args); node = UnscrewSkill(); executor = MultiThreadedExecutor(); executor.add_node(node)
-    spin_thread = threading.Thread(target=executor.spin, daemon=True); spin_thread.start()
+    rclpy.init(args=args)
+    node = UnscrewSkill()
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
+    
+    # Run loop in thread
+    loop_thread = threading.Thread(target=executor.spin, daemon=True)
+    loop_thread.start()
+    
     try:
-        node.moveit_backend.reset_robot()
         while rclpy.ok():
-            with node.data_lock: current_targets = copy.deepcopy(node.latest_screw_targets)
-            if not current_targets: time.sleep(1.0); continue
-            for part in current_targets:
-                if not rclpy.ok(): return
-                if node.execute_unscrew_command(part['id'], part['label'], interactive=True):
-                    if input(f"\n👉 GATE 5: Part Complete. Next? ('q'=quit): ").lower() == 'q': sys.exit(0)
-            time.sleep(5.0) 
+            with node.data_lock:
+                targets = copy.deepcopy(node.latest_screw_targets)
+            if not targets:
+                time.sleep(1.0)
+                continue
+            
+            for part in targets:
+                node.execute_unscrew_command(part['id'], part['label'], interactive=False)
+            time.sleep(2.0)
     except KeyboardInterrupt: pass
-    finally: node.destroy_node(); rclpy.shutdown()
+    finally: rclpy.shutdown()
 
 if __name__ == '__main__':
     main()

@@ -2,7 +2,8 @@
 import rclpy
 from rclpy.node import Node
 from rclpy.executors import MultiThreadedExecutor
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, String
+import threading
 import threading
 import math
 import time
@@ -18,11 +19,8 @@ class ObjectFlipSkill(Node):
         self.uf850 = MotionBackend(self, "uf_arm")
         self.gripper = MotionBackend(self, "rg6_gripper")
         
-        # 2. Hold Status Subscriber (Used only for standalone trigger)
-        self.is_holding_object = False
-        self.last_logged_status = None  
-        self.hold_event = threading.Event()
-        self.create_subscription(Bool, '/object_hold_status', self.hold_status_callback, 10)
+        # 2. State Publisher
+        self.state_pub = self.create_publisher(String, '/robot_state/manip_arm/update', 10)
         
         self.get_logger().info("🚀 Object Flip Skill Node Active.")
 
@@ -43,18 +41,10 @@ class ObjectFlipSkill(Node):
         self.RETRACT_DISTANCE = 0.005  # 5mm Retract for the drop
         # =================================================
 
-    def hold_status_callback(self, msg):
-        """Triggers the event on ANY status update, but only logs on changes."""
-        self.is_holding_object = msg.data
-        
-        if self.last_logged_status != self.is_holding_object:
-            if self.is_holding_object:
-                self.get_logger().info("✅ Hold Status changed to TRUE. Object detected in jaws.")
-            else:
-                self.get_logger().warn("⚠️ Hold Status changed to FALSE. Waiting...")
-            self.last_logged_status = self.is_holding_object
-        
-        self.hold_event.set() 
+    def publish_arm_state(self, state_str: str):
+        msg = String()
+        msg.data = state_str
+        self.state_pub.publish(msg)
 
     def get_current_tcp_pose(self):
         try:
@@ -96,41 +86,40 @@ class ObjectFlipSkill(Node):
         return False
 
     def descend_until_contact(self):
-        self.get_logger().info(f"⬇️ Starting Native SDK Tactile Descent (Target Joint: {self.CONTACT_JOINT})")
+        baseline_effort = self.uf850.current_joint_efforts.get(self.CONTACT_JOINT, 0.0)
+        self.get_logger().info(f"⬇️ Starting Native SDK Tactile Descent (Target Joint: {self.CONTACT_JOINT}, Baseline: {baseline_effort:.4f}Nm)")
         self.contact_detected = False
         last_print_time = time.time()
+        start_t = time.time()
 
         def check_force():
-            nonlocal last_print_time
-            effort = self.uf850.current_joint_efforts.get(self.CONTACT_JOINT, -99.0)
+            nonlocal last_print_time, start_t
+            curr_effort = self.uf850.current_joint_efforts.get(self.CONTACT_JOINT, baseline_effort)
+            spike = abs(curr_effort - baseline_effort)
             
             if time.time() - last_print_time > 0.1:
-                print(f"   [Live Debug] Current {self.CONTACT_JOINT} Effort: {effort:.4f} Nm")
+                print(f"   [Live Debug] Current {self.CONTACT_JOINT} Effort: {curr_effort:.4f} Nm (Spike: {spike:.4f} Nm)")
                 last_print_time = time.time()
 
-            if effort > self.TORQUE_THRESHOLD:
-                self.get_logger().warn(f"💥 THRESHOLD CROSSED! Actual Spike: {effort:.4f} Nm")
-                self.contact_detected = True
-                return True 
+            if (time.time() - start_t) > 0.2:
+                if spike > self.TORQUE_THRESHOLD:
+                    self.get_logger().warn(f"💥 THRESHOLD CROSSED! Actual Spike: {spike:.4f} Nm")
+                    self.contact_detected = True
+                    return True 
             return False
 
         self.uf850.move_linear_z_sdk_with_force_stop(
             distance_down_m=0.25, 
-            speed_mm_s=10.0, 
+            speed_mm_s=26.0, 
             check_force_callback=check_force
         )
-
-        if not self.contact_detected:
-            self.get_logger().error("❌ Max descent reached without sensing contact.")
-            self.uf850.reset_robot() 
-            return False
 
         self.get_logger().info("🔄 Clearing hardware error state after contact stop...")
         self.uf850.reset_robot()
         time.sleep(0.5)
 
         self.get_logger().info(f"⬆️ Attempting SDK Retraction: {self.RETRACT_DISTANCE*1000}mm UP...")
-        success = self.uf850.jog_cartesian_sdk(dx_m=0.0, dy_m=0.0, dz_m=self.RETRACT_DISTANCE, speed_mm_s=20.0)
+        success = self.uf850.jog_cartesian_sdk(dx_m=0.0, dy_m=0.0, dz_m=self.RETRACT_DISTANCE, speed_mm_s=26.0)
         
         if not success:
             self.get_logger().error("❌ SDK Retraction command failed to execute.")
@@ -144,6 +133,7 @@ class ObjectFlipSkill(Node):
         Pure motion logic. Can be called directly as a library function.
         Defaults to interactive=False for automated script execution.
         """
+        self.publish_arm_state("FLIPPING")
         print("\n" + "!"*60)
         print("🤖 INITIATING FLIP SKILL")
         print("!"*60)
@@ -197,12 +187,12 @@ class ObjectFlipSkill(Node):
         
         if not is_held:
             self.get_logger().error("❌ Failed to re-grasp the object after flipping.")
+            self.publish_arm_state("IDLE")
             return False
 
         print("\n🎉 FLIP SKILL COMPLETE: Object successfully flipped and re-grasped.")
+        self.publish_arm_state("IDLE")
         return True
-
-
 # =====================================================================
 # STANDALONE EXECUTION BLOCK (Event-Driven)
 # =====================================================================
@@ -213,31 +203,15 @@ def main(args=None):
     executor.add_node(flip_node)
     spin_thread = threading.Thread(target=executor.spin, daemon=True)
     spin_thread.start()
-    
+
     try:
-        # Standalone Event Loop
-        while rclpy.ok():
-            print("\n" + "="*60)
-            print("🕒 Waiting for Hold Skill to finish (/object_hold_status update)...")
-            print("="*60)
-            
-            flip_node.hold_event.clear()
-            flip_node.hold_event.wait() 
-            
-            if flip_node.is_holding_object:
-                # Trigger the function interactively for manual stepping in standalone mode
-                flip_node.execute_flip(interactive=True)
-                
-                # Reset status to wait for the next cycle
-                flip_node.is_holding_object = False 
-            else:
-                flip_node.get_logger().error("❌ Cannot execute flip. The object was not securely held.")
-                
-            time.sleep(1.0) 
-            
-    except KeyboardInterrupt: 
+        final_status = flip_node.execute_flip(interactive=False)
+        print(f"\n⏳ Flip Sequence Complete. Status: {final_status}")
+        time.sleep(1.0)
+
+    except KeyboardInterrupt:
         pass
-        
+
     flip_node.destroy_node()
     rclpy.shutdown()
 

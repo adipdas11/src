@@ -28,10 +28,13 @@ setup(
         ],
     },
     entry_points={
-        'console_scripts': [         
+        'console_scripts': [
             'object_hold_skill = disassembly_skills.object_hold_skill:main',
             'unscrew_skill = disassembly_skills.unscrew_skill:main',
             'object_flip_skill = disassembly_skills.object_flip_skill:main',
+            'object_flip_drop_skill = disassembly_skills.object_flip_drop_skill:main',
+            'object_pickup_skill = disassembly_skills.object_pickup_skill:main',
+            'state_managers = disassembly_skills.state_managers:main',
             'master_node = disassembly_skills.master_node:main',
         ],
     },

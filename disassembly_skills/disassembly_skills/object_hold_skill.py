@@ -9,7 +9,6 @@ import json
 import math
 import time
 
-# Import the backend containing SDK controllers & dynamic IP switching
 from disassembly_skills.motion_backend import MotionBackend
 
 class ObjectHoldSkill(Node):
@@ -24,16 +23,15 @@ class ObjectHoldSkill(Node):
         self.create_subscription(String, '/vision/agent_state', self.vision_callback, 10)
 
         self.hold_status_pub = self.create_publisher(Bool, '/object_hold_status', 10)
+        self.state_pub = self.create_publisher(String, '/robot_state/manip_arm/update', 10)
         
-        self.get_logger().info("🚀 Object Hold Skill Node: Native SDK Tactile Mode Active.")
+        self.get_logger().info("🚀 Object Hold Skill Node: SDK Tactile Mode Active.")
 
         # ================= CONFIGURATION =================
         self.CAMERA_FRAME = 'camera_color_optical_frame' 
         self.PLANNING_FRAME = 'world_world'    
         self.TOOL_LENGTH = 0.28                
-        self.APPROACH_BUFFER = 0.05            
-        self.SAFETY_Z_HEIGHT = -0.003          
-        self.HOVER_Z_OFFSET = 0.10             
+        self.HOVER_Z_OFFSET = 0.05             
         
         self.JOINT_GRIPPER = "rg6_l_out"
         self.OPEN_DEG = 35.0
@@ -41,25 +39,30 @@ class ObjectHoldSkill(Node):
         self.GRIPPER_SPEED = 0.3
 
         self.INVERT_VISION_ANGLE = True  
-        self.JAWS_ROTATION_DEG = 0.0  
-        self.APPROACH_SIDE_OFFSET_DEG = 0.0 
-        self.FLIP_GRIPPER_UPSIDE_DOWN = False  
-        self.GRIPPER_TILT_DEG = 8.0  
+        self.GRIPPER_TILT_DEG = 7.0  
 
         self.CONTACT_JOINT = "u1_joint5"
-        self.TORQUE_THRESHOLD =1.0    
-        self.RETRACT_DISTANCE = 0.02  
+        self.TORQUE_THRESHOLD = 3.0     # Nm — matches v4
+        self.RETRACT_DISTANCE = 0.005   # 5mm retract after contact
         self.ROBOT_EE_LINK = "u1_tool0"
-
-        self.FINAL_ALIGN_YAW_DEG = 90.0       
-        self.REMOVE_TILT_ON_ALIGN = False    
+        
+        # SDK MINIMUM SPEED: 26mm/s to guarantee robot execution
+        self.SDK_MIN_SPEED = 26.0
+        self.SDK_DESCENT_SPEED = 30.0   # Tactile descent speed
+        self.SDK_RETRACT_SPEED = 30.0   # Retract speed
         # =================================================
 
-    def publish_hold_status(self, is_held: bool):
+    def publish_arm_state(self, state_str: str):
+        msg = String()
+        msg.data = state_str
+        self.state_pub.publish(msg)
+
+    def publish_hold_status(self, is_held: bool, quiet=False):
         msg = Bool()
         msg.data = is_held
         self.hold_status_pub.publish(msg)
-        self.get_logger().info(f"📢 Published Hold Status: {is_held}")
+        if not quiet:
+            self.get_logger().info(f"📢 Published Hold Status: {is_held}")
 
     def vision_callback(self, msg):
         try:
@@ -84,84 +87,93 @@ class ObjectHoldSkill(Node):
         start_time = time.time()
         last_pos = 999.0
         stall_timer = 0.0
+        is_closing = target_deg < 0
         while rclpy.ok() and (time.time() - start_time) < timeout:
             current_pos = self.gripper.current_joint_positions.get(self.JOINT_GRIPPER, 999)
             if current_pos == 999:
                 time.sleep(0.1); continue
             if abs(current_pos - target_rad) < 0.05: return True
-            if abs(current_pos - last_pos) < 0.005:
+            if abs(current_pos - last_pos) < 0.002:
                 stall_timer += 0.1
                 if stall_timer >= 0.5:
-                    self.get_logger().info("✅ Gripper stalled (Object grasped).")
-                    return True
+                    if is_closing:
+                        self.get_logger().info(f"📦 Grasp Secured: Stalled at {current_pos:.3f} rad.")
+                        return True
+                    else:
+                        return False
             else: stall_timer = 0.0
             last_pos = current_pos
             time.sleep(0.1)
         return False
 
-    def descend_until_contact(self, q_dict, custom_retract=None):
-        retract_dist = custom_retract if custom_retract is not None else self.RETRACT_DISTANCE
+    def wait_for_arm_settled(self, timeout=20.0):
+        time.sleep(0.2)
+        start_t = time.time()
+        settle_timer = 0.0
+        last_positions = {}
+        while rclpy.ok() and (time.time() - start_t) < timeout:
+            curr_positions = self.uf850.current_joint_positions.copy()
+            if not curr_positions:
+                time.sleep(0.1); continue
+            if last_positions:
+                max_delta = max(abs(curr_positions[n] - last_positions[n]) 
+                                for n in curr_positions if n in last_positions)
+                if max_delta <= 0.006:
+                    settle_timer += 0.1
+                    if settle_timer >= 0.4: return True
+                else: settle_timer = 0.0
+            last_positions = curr_positions
+            time.sleep(0.1)
+        return True
 
-        self.get_logger().info(f"⬇️ Starting Native SDK Tactile Descent (Target Joint: {self.CONTACT_JOINT})")
+    def descend_until_contact(self):
+        """SDK-based tactile descent. Uses move_linear_z_sdk_with_force_stop with correct speed."""
+        baseline_effort = self.uf850.current_joint_efforts.get(self.CONTACT_JOINT, 0.0)
+        self.get_logger().info(f"⬇️ SDK Tactile Descent (Joint: {self.CONTACT_JOINT}, Threshold: {self.TORQUE_THRESHOLD}Nm, Speed: {self.SDK_DESCENT_SPEED}mm/s, Baseline: {baseline_effort:.3f}Nm)")
         self.contact_detected = False
         last_print_time = time.time()
+        start_t = time.time()
 
         def check_force():
-            nonlocal last_print_time
-            effort = self.uf850.current_joint_efforts.get(self.CONTACT_JOINT, -99.0)
+            nonlocal last_print_time, start_t
+            curr_effort = self.uf850.current_joint_efforts.get(self.CONTACT_JOINT, baseline_effort)
+            spike = abs(curr_effort - baseline_effort)
             
             if time.time() - last_print_time > 0.1:
-                print(f"   [Live Debug] Current {self.CONTACT_JOINT} Effort: {effort:.4f} Nm")
+                print(f"   [Live] {self.CONTACT_JOINT} Effort: {curr_effort:.4f} Nm (Spike: {spike:.4f} Nm)")
                 last_print_time = time.time()
 
-            if effort > self.TORQUE_THRESHOLD:
-                self.get_logger().warn(f"💥 THRESHOLD CROSSED! Actual Spike: {effort:.4f} Nm")
-                self.contact_detected = True
-                return True 
+            # 0.2s blanking time to ignore initial movement jerk
+            if (time.time() - start_t) > 0.2:
+                if spike > self.TORQUE_THRESHOLD:
+                    self.get_logger().warn(f"💥 CONTACT! Spike: {spike:.4f} Nm")
+                    self.contact_detected = True
+                    return True 
             return False
 
-        # 1. Perform the SDK Descent
         self.uf850.move_linear_z_sdk_with_force_stop(
             distance_down_m=0.15, 
-            speed_mm_s=10.0, 
+            speed_mm_s=self.SDK_DESCENT_SPEED,
             check_force_callback=check_force
         )
 
-        if not self.contact_detected:
-            self.get_logger().error("❌ Max descent reached without sensing contact.")
-            self.uf850.reset_robot() 
-            return False
-
-        # 2. Clear the hardware collision state
         self.get_logger().info("🔄 Clearing hardware error state after contact stop...")
         self.uf850.reset_robot()
         time.sleep(0.5)
 
-        # 3. Use SDK to Retract (Bypassing MoveIt completely)
-        self.get_logger().info(f"⬆️ Attempting SDK Retraction: {retract_dist*1000}mm UP...")
-        
-        # jog_cartesian_sdk takes relative dx, dy, dz in meters. Moving UP is positive Z.
-        success = self.uf850.jog_cartesian_sdk(dx_m=0.0, dy_m=0.0, dz_m=retract_dist, speed_mm_s=20.0)
+        # Retract after contact
+        self.get_logger().info(f"⬆️ SDK Retract: {self.RETRACT_DISTANCE*1000}mm UP at {self.SDK_RETRACT_SPEED}mm/s")
+        success = self.uf850.jog_cartesian_sdk(dx_m=0.0, dy_m=0.0, dz_m=self.RETRACT_DISTANCE, speed_mm_s=self.SDK_RETRACT_SPEED)
         
         if not success:
-            self.get_logger().error("❌ SDK Retraction command failed to execute.")
+            self.get_logger().error("❌ SDK Retraction command failed.")
             return False
 
-        # Let the robot physically settle before confirming
         time.sleep(0.5)
-        
-        check_pos = self.get_current_tcp_position()
-        if check_pos:
-            self.get_logger().info(f"✅ SDK Retraction complete! Current Z: {check_pos[2]:.4f}")
-            
         return True
 
-    def execute_hold(self, part_id: int, target_label: str, interactive=True):
-        """
-        Wrapper function to GUARANTEE the final status is published, 
-        even if the sequence fails early.
-        """
-        # Small delay to ensure ROS 2 publisher is fully registered before sending first message
+    def execute_hold(self, part_id: int, target_label: str, interactive=False):
+        """Wrapper ensuring hold status is always published."""
         time.sleep(0.5) 
         self.publish_hold_status(False)
         
@@ -171,32 +183,36 @@ class ObjectHoldSkill(Node):
         except Exception as e:
             self.get_logger().error(f"❌ Hold Sequence crashed: {e}")
         finally:
-            # This ensures that no matter what happens, the network gets the final True/False result
             self.publish_hold_status(success)
             return success
 
-    def _run_hold_sequence(self, part_id, target_label, interactive):
+    def _run_hold_sequence(self, part_id, target_label, interactive=False):
         """
-        The actual motion logic.
+        Simplified hold sequence (matching v4 approach):
+        1. Hover above target with tilt
+        2. Tactile descent → contact → retract 5mm
+        3. Close gripper
+        No slide-in motion.
         """
         print("\n" + "!"*60)
-        print(f"🤖 INITIATING TACTILE HOLD SKILL: {target_label} (ID: {part_id})")
+        print(f"🤖 INITIATING HOLD SKILL: {target_label} (ID: {part_id})")
         print("!"*60)
 
-        print("   👀 Waiting for fresh vision data on '/vision/agent_state'...")
+        self.publish_arm_state("MOVING")
+
+        print("   👀 Waiting for fresh vision data...")
         self.vision_event.clear()
         if not self.vision_event.wait(timeout=10.0): 
-            self.get_logger().error("❌ Vision data timeout! Is the camera node running?")
+            self.get_logger().error("❌ Vision data timeout!")
             return False
         
         objects = self.latest_vision_data.get("global_view", {}).get("objects", [])
         target_obj = next((obj for obj in objects if obj.get("id") == part_id), None)
         if not target_obj: 
-            self.get_logger().error(f"❌ Target object (ID: {part_id}) not found in current vision state!")
+            self.get_logger().error(f"❌ Target (ID: {part_id}) not found in vision state!")
             return False
 
         raw_x, raw_y, raw_z = target_obj["xyz"]
-        obj_angle_deg = -target_obj["angle"] if self.INVERT_VISION_ANGLE else target_obj["angle"]
 
         print(f"\n✅ Target Locked: {target_label}")
         print(f"📍 Raw Vision Coords: X:{raw_x:.4f}, Y:{raw_y:.4f}, Z:{raw_z:.4f}")
@@ -207,78 +223,61 @@ class ObjectHoldSkill(Node):
         transformed_pose = self.uf850.get_transformed_pose(source_pose, self.CAMERA_FRAME, self.PLANNING_FRAME)
         
         if not transformed_pose: 
-            self.get_logger().error("❌ TF Transformation Failed! Cannot map camera to world.")
+            self.get_logger().error("❌ TF Transformation Failed!")
             return False
             
-        world_x, world_y, world_z = transformed_pose.pose.position.x, transformed_pose.pose.position.y, transformed_pose.pose.position.z
+        world_x = transformed_pose.pose.position.x
+        world_y = transformed_pose.pose.position.y
+        world_z = transformed_pose.pose.position.z
 
-        # --- TILTED FLIGHT PLAN ---
-        obj_yaw_rad = math.radians(obj_angle_deg)
-        approach_vector_rad = obj_yaw_rad + (math.pi / 2.0) + math.radians(self.APPROACH_SIDE_OFFSET_DEG)
+        # --- TILTED HOVER POSE CALCULATION (matches v4) ---
         tilt_rad = math.radians(self.GRIPPER_TILT_DEG)
-        
-        horizontal_tool_length = self.TOOL_LENGTH * math.cos(tilt_rad)
-        z_lift_offset = self.TOOL_LENGTH * math.sin(tilt_rad)
-        total_horizontal_offset = horizontal_tool_length + self.APPROACH_BUFFER
-        
-        target_x = world_x - (total_horizontal_offset * math.cos(approach_vector_rad))
-        target_y = world_y - (total_horizontal_offset * math.sin(approach_vector_rad))
-        target_z = world_z + self.SAFETY_Z_HEIGHT + z_lift_offset
-        hover_z = target_z + self.HOVER_Z_OFFSET
-        
-        grasp_x = world_x - (horizontal_tool_length * math.cos(approach_vector_rad))
-        grasp_y = world_y - (horizontal_tool_length * math.sin(approach_vector_rad))
-        
-        roll_angle = math.pi + math.radians(self.JAWS_ROTATION_DEG) if not self.FLIP_GRIPPER_UPSIDE_DOWN else math.radians(self.JAWS_ROTATION_DEG)
-        pitch_angle = -math.pi/2 + tilt_rad
-        
-        q = self.uf850._rpy_to_quaternion(roll_angle, pitch_angle, approach_vector_rad)
+        v_rad = math.radians(90.0)  # Fixed approach angle
+
+        q = self.uf850._rpy_to_quaternion(math.pi, -math.pi/2.0 + tilt_rad, v_rad)
         q_dict = {'qx': q.x, 'qy': q.y, 'qz': q.z, 'qw': q.w}
 
-        aligned_yaw_rad = math.radians(self.FINAL_ALIGN_YAW_DEG)
-        aligned_pitch_rad = -math.pi/2 if self.REMOVE_TILT_ON_ALIGN else pitch_angle
-        q_aligned = self.uf850._rpy_to_quaternion(roll_angle, aligned_pitch_rad, aligned_yaw_rad)
-        q_dict_aligned = {'qx': q_aligned.x, 'qy': q_aligned.y, 'qz': q_aligned.z, 'qw': q_aligned.w}
+        # Wrist offset from tool length + tilt
+        off = self.TOOL_LENGTH * math.cos(tilt_rad)
+        tx = world_x - (off * math.cos(v_rad))
+        ty = world_y - (off * math.sin(v_rad))
+        hz = world_z + self.HOVER_Z_OFFSET + (self.TOOL_LENGTH * math.sin(tilt_rad))
 
-        # --- EXECUTION FLOW ---
-        if interactive: input(f"\n🚀 STEP 1: Move to SAFE HOVER Position? [Enter]")
+        # --- STEP 1: HOVER ---
+        if interactive: input(f"\n🚀 STEP 1: Move to Hover Position? [Enter]")
+        print("🔓 Opening gripper...")
         self.gripper.move_to_joint_positions({self.JOINT_GRIPPER: math.radians(self.OPEN_DEG)}, "rg6", velocity=self.GRIPPER_SPEED)
         self.wait_for_gripper(self.OPEN_DEG)
-        self.uf850.move_to_pose_robust(target_x, target_y, hover_z, q_dict, link_name=self.ROBOT_EE_LINK, velocity=0.1)
 
-        if interactive: input(f"\n🚀 STEP 2: Start 1st SDK TACTILE DESCENT (Retracts {self.RETRACT_DISTANCE*1000}mm)? [Enter]")
-        if not self.descend_until_contact(q_dict): return False
-        
-        if interactive: input(f"\n🚀 STEP 3: Slide Forward into Grasp Position? [Enter]")
-        current_safe_z = self.get_current_tcp_position()[2]
-        self.uf850.move_to_pose_robust(grasp_x, grasp_y, current_safe_z, q_dict, link_name=self.ROBOT_EE_LINK, velocity=0.05)
+        print(f"🚁 Moving to tilted hover pose (Z: {hz:.3f})...")
+        success = self.uf850.move_to_pose_robust(tx - 0.01, ty - 0.005, hz, q_dict, link_name=self.ROBOT_EE_LINK, velocity=0.1)
+        if not success:
+            self.get_logger().warn("MoveIt reported failure, but proceeding to verify physically...")
+        self.wait_for_arm_settled()
 
-        if interactive: input(f"\n🚀 STEP 4: Start 2nd (FINAL) SDK TACTILE DESCENT (Retracts 2mm)? [Enter]")
-        if not self.descend_until_contact(q_dict, custom_retract=0.005): return False
+        # --- STEP 2: TACTILE DESCENT ---
+        if interactive: input(f"\n🚀 STEP 2: SDK Tactile Descent? [Enter]")
+        if not self.descend_until_contact(): 
+            return False
+        self.wait_for_arm_settled()
 
-        if interactive: input(f"\n🚀 STEP 5: CLOSE Gripper to Secure {target_label}? [Enter]")
+        # --- STEP 3: CLOSE GRIPPER ---
+        if interactive: input(f"\n🚀 STEP 3: CLOSE Gripper to Secure {target_label}? [Enter]")
         self.gripper.move_to_joint_positions({self.JOINT_GRIPPER: math.radians(self.CLOSE_DEG)}, "rg6", velocity=self.GRIPPER_SPEED)
         is_held = self.wait_for_gripper(self.CLOSE_DEG)
         
         if not is_held:
             self.get_logger().error("❌ Failed to grasp the object.")
+            self.publish_arm_state("IDLE")
             return False
             
-        print(f"\n🎉 SECURED: {target_label} (2mm above sensed surface).")
-
-        if interactive: input(f"\n🚀 STEP 6: Square Object to World Axes (Yaw: {self.FINAL_ALIGN_YAW_DEG}°)? [Enter]")
-        current_pose = self.get_current_tcp_position()
-        if current_pose:
-            self.get_logger().info("🔄 Rotating to align object perfectly straight...")
-            self.uf850.move_to_pose_robust(
-                current_pose[0], current_pose[1], current_pose[2], q_dict_aligned, 
-                link_name=self.ROBOT_EE_LINK, velocity=0.03, frame_id=self.PLANNING_FRAME
-            )
-
+        print(f"\n🎉 SECURED: {target_label}")
+        self.publish_arm_state("HOLDING")
         return True
 
+
 # =====================================================================
-# STANDALONE EXECUTION BLOCK (When run directly via 'ros2 run')
+# STANDALONE EXECUTION
 # =====================================================================
 def main(args=None):
     rclpy.init(args=args)
@@ -289,16 +288,13 @@ def main(args=None):
     spin_thread.start()
     
     try:
-        # Capture the final boolean result of the hold sequence
-        final_status = hold_node.execute_hold(part_id=0, target_label="Top_Lid", interactive=True)
+        final_status = hold_node.execute_hold(part_id=0, target_label="Top_Lid", interactive=False)
         
-        print("\n⏳ Hold Sequence Complete.")
-        print(f"📡 Continuously broadcasting final status ({final_status}) at 1Hz...")
+        print(f"\n⏳ Hold Sequence Complete. Status: {final_status}")
+        hold_node.publish_hold_status(final_status)
         
-        # Continuously publish the status so late-joining nodes (like the Flip Skill) catch it
-        while rclpy.ok():
-            hold_node.publish_hold_status(final_status)
-            time.sleep(1.0)
+        # Give ROS time to broadcast before exiting cleanly
+        time.sleep(1.0)
             
     except KeyboardInterrupt: 
         pass
