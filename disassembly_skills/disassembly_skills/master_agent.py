@@ -232,7 +232,7 @@ class MasterAgentNode(Node):
         self.cleared_zones = []       # Stores XYZ tuples of removed parts
         self.EXCLUSION_RADIUS = 0.010 # 15mm spherical blind spot tolerance
 
-        API_KEY_FILE = "/home/adip/workspaces/disassembly_ws/src/disassembly_skills/config/api_key.txt"
+        API_KEY_FILE = "/home/adip/workspace/disassembly_ws/src/disassembly_skills/config/api_key.txt"
         try:
             with open(API_KEY_FILE, "r") as f: OPENAI_API_KEY = f.read().strip()
         except FileNotFoundError: raise RuntimeError(f"Missing {API_KEY_FILE}.")

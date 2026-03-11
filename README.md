@@ -40,19 +40,35 @@ This repository contains the source code for the Disassembly Automation project,
 
 1. **Clone the repository:**
    ```bash
-   # If you haven't already
+   # If you haven't already, create a workspace and clone
+   mkdir -p ~/workspace/disassembly_ws/src
+   cd ~/workspace/disassembly_ws
    git clone <repository_url> src
    ```
 
 2. **Install Dependencies:**
-   Navigate to the workspace root (one level up from `src`) and run:
+   Navigate to the workspace root (`~/workspace/disassembly_ws`) and install the necessary system dependencies and ROS 2 packages:
    ```bash
+   # Install specific Python and system dependencies
+   sudo apt-get update
+   sudo apt-get install -y python3-numpy python3-serial freeglut3-dev
+   sudo apt-get install -y ros-humble-launch* ros-humble-ros2launch ros-humble-ros2run
+
+   # Install specific Python dependencies for real hardware control
+   pip install xarm-python-sdk pymodbus==2.5.3
+
+   # Initialize and install ROS 2 dependencies
+   source /opt/ros/humble/setup.bash
    rosdep update
-   rosdep install --from-paths src --ignore-src -r -y
+   # Use the correct rosdistro according to your active ROS 2 installation (Humble used here)
+   rosdep install --from-paths src --ignore-src -r -y --rosdistro humble
    ```
 
 3. **Build the Workspace:**
    ```bash
+   # Clean previous builds to avoid cache issues if rebuilding
+   rm -rf build install log
+   
    colcon build --symlink-install
    ```
 

@@ -25,7 +25,7 @@ from pathlib import Path
 
 # ─── CONFIGURATION ───────────────────────────────────────────────────────────
 
-WS = Path.home() / "workspaces" / "disassembly_ws"
+WS = Path.home() / "workspace" / "disassembly_ws"
 WS_SRC = WS / "src"
 
 # Input URDF (the xacro-generated flat file)

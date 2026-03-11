@@ -12,12 +12,20 @@ from moveit_configs_utils import MoveItConfigsBuilder
 
 def launch_setup(context, *args, **kwargs):
     hw_type = LaunchConfiguration('hardware_type').perform(context)
+    ft_sensor_ftdi_id = LaunchConfiguration('ft_sensor_ftdi_id')
+    ft_sensor_max_retries = LaunchConfiguration('ft_sensor_max_retries')
+    ft_sensor_frame_id = LaunchConfiguration('ft_sensor_frame_id')
     
     print(f"\n{'='*50}\n🚀 STARTING DUAL-ARM SYSTEM IN [{hw_type.upper()}] MODE\n{'='*50}\n")
 
     moveit_config_pkg = "dual_arm_moveit_config"
     pkg_share = get_package_share_directory(moveit_config_pkg)
     rviz_config_file = os.path.join(pkg_share, "rviz", "dual_arm.rviz")
+    sensors_3d_config = os.path.join(pkg_share, "config", "sensors_3d.yaml")
+    sensors_3d_params = []
+    if os.path.exists(sensors_3d_config):
+        with open(sensors_3d_config, 'r') as file:
+            sensors_3d_params.append(yaml.safe_load(file))
     
     # 1. Load MoveIt Config 
     moveit_config = (
@@ -57,7 +65,12 @@ def launch_setup(context, *args, **kwargs):
     ft_sensor_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(os.path.join(
             get_package_share_directory('robotiq_ft_sensor_hardware'),
-            'launch', 'ft_sensor_standalone.launch.py'))
+            'launch', 'ft_sensor_standalone.launch.py')),
+        launch_arguments={
+            'ftdi_id': ft_sensor_ftdi_id,
+            'max_retries': ft_sensor_max_retries,
+            'frame_id': ft_sensor_frame_id,
+        }.items()
     )
     
     real_hw_process = ExecuteProcess(
@@ -79,20 +92,20 @@ def launch_setup(context, *args, **kwargs):
             'launch', 'publish.launch.py')),
         launch_arguments={
             'name': 'realsense_handeye',
-            'calibration_file': '/home/adip/workspaces/disassembly_ws/src/disassembly_skills/config/realsense_handeye.calib'
+            'calibration_file': '/home/adip/workspace/disassembly_ws/src/disassembly_skills/config/realsense_handeye.calib'
         }.items()
     )
 
     # 5. MoveGroup, RViz & Custom Nodes
     run_move_group_node = Node(
         package="moveit_ros_move_group", executable="move_group",
-        parameters=[moveit_config.to_dict(), {"use_sim_time": False}],
+        parameters=[moveit_config.to_dict(), *sensors_3d_params, {"use_sim_time": False, "octomap_resolution": 0.05}],
     )
 
     run_rviz_node = Node(
         package="rviz2", executable="rviz2",
         arguments=["-d", rviz_config_file],
-        parameters=[moveit_config.to_dict()],
+        parameters=[moveit_config.to_dict(), {"octomap_resolution": 0.05}],
     )
     
     state_manager = ExecuteProcess(cmd=['ros2', 'run', 'dual_arm_moveit_config', 'state_manager.py'], output='screen', on_exit=Shutdown())
@@ -113,10 +126,11 @@ def launch_setup(context, *args, **kwargs):
         name="xarm_servo_node",
         parameters=[
             {"moveit_servo": xarm_servo_params},
-            {"use_sim_time": False},
+            {"use_sim_time": False, "octomap_resolution": 0.05},
             moveit_config.robot_description,
             moveit_config.robot_description_semantic,
             moveit_config.robot_description_kinematics,
+            *sensors_3d_params,
         ],
         output="screen",
     )
@@ -132,10 +146,11 @@ def launch_setup(context, *args, **kwargs):
         name="uf_servo_node",
         parameters=[
             {"moveit_servo": uf_servo_params}, 
-            {"use_sim_time": False},
+            {"use_sim_time": False, "octomap_resolution": 0.05},
             moveit_config.robot_description,
             moveit_config.robot_description_semantic,
             moveit_config.robot_description_kinematics,
+            *sensors_3d_params,
         ],
         output="screen",
     )
@@ -237,5 +252,17 @@ def generate_launch_description():
             'hardware_type',
             default_value='fake',
             description='Select hardware type: "real", "fake", or "isaac"'),
+        DeclareLaunchArgument(
+            'ft_sensor_ftdi_id',
+            default_value='',
+            description='Optional FTDI device id for the Robotiq FT sensor'),
+        DeclareLaunchArgument(
+            'ft_sensor_max_retries',
+            default_value='100',
+            description='Number of stream retries before reinitializing the Robotiq FT sensor'),
+        DeclareLaunchArgument(
+            'ft_sensor_frame_id',
+            default_value='robotiq_ft_frame_id',
+            description='Frame id for published Robotiq FT wrench messages'),
         OpaqueFunction(function=launch_setup)
     ])

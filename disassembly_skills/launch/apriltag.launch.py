@@ -6,7 +6,7 @@ def generate_launch_description():
     # Hardcoded path to your config file
     config_file = os.path.join(
         os.getenv('HOME'), 
-        'workspaces/disassembly_ws/src/disassembly_skills/config/tags.yaml'
+        'workspace/disassembly_ws/src/disassembly_skills/config/tags.yaml'
     )
 
     return LaunchDescription([

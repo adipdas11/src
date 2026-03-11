@@ -274,6 +274,13 @@ def main(args=None):
     rclpy.init(args=args); node = RealHardware()
     try: rclpy.spin(node)
     except KeyboardInterrupt: pass
-    finally: rclpy.shutdown()
+    finally:
+        try:
+            node.destroy_node()
+        finally:
+            try:
+                rclpy.shutdown()
+            except Exception:
+                pass
 
 if __name__ == '__main__': main()

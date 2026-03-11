@@ -15,7 +15,7 @@ import os
 import sys
 
 # Inject shared AI venv (same as vision_agent/agent_node_v2.py)
-VENV_PATH = '/home/adip/workspaces/disassembly_ws/src/vision_training/train_vision_model/.venv/lib/python3.10/site-packages'
+VENV_PATH = '/home/adip/workspace/disassembly_ws/src/vision_training/train_vision_model/.venv/lib/python3.10/site-packages'
 sys.path.insert(0, VENV_PATH)
 
 import cv2
@@ -250,7 +250,7 @@ class HandTrackerNode(Node):
                     os.path.dirname(os.path.dirname(os.path.dirname(
                         os.path.dirname(pkg_dir)))),
                     'src', 'hand_teleop', 'config', 'hand_landmarker.task'),
-                '/home/adip/workspaces/disassembly_ws/src/hand_teleop/config/hand_landmarker.task',
+                '/home/adip/workspace/disassembly_ws/src/hand_teleop/config/hand_landmarker.task',
             ]
             self.model_path = None
             for c in candidates:
@@ -552,7 +552,7 @@ class HandTrackerNode(Node):
         candidates = [
             os.path.join(pkg_dir, '..', 'config',
                          'pose_landmarker_lite.task'),
-            '/home/adip/workspaces/disassembly_ws/src/hand_teleop/config/'
+            '/home/adip/workspace/disassembly_ws/src/hand_teleop/config/'
             'pose_landmarker_lite.task',
         ]
         for c in candidates:

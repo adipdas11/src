@@ -6,6 +6,7 @@ from std_msgs.msg import Bool, String
 class ObjectHoldStateManager(Node):
     """
     Central State Manager for the Gripper's Hold Status.
+
     Listens to the hold skill, caches the current state, and broadcasts 
     updates to the rest of the ROS 2 network.
     """
@@ -41,8 +42,7 @@ class ObjectHoldStateManager(Node):
 
     def hold_status_callback(self, msg: Bool):
         """
-        Triggered whenever the Object Hold Skill or Flip Drop Skill 
-        successfully grasps or drops an object.
+        Handle object hold state changes from the grasp pipeline.
         """
         # Only log and update if the state actually changes
         if self.is_holding != msg.data:
@@ -58,9 +58,7 @@ class ObjectHoldStateManager(Node):
             self.broadcast_state()
 
     def broadcast_state(self):
-        """
-        Publishes the cached state to both the Boolean and String topics.
-        """
+        """Publish the cached state to the Boolean and String topics."""
         # Publish Boolean
         bool_msg = Bool()
         bool_msg.data = self.is_holding
@@ -80,8 +78,13 @@ def main(args=None):
     except KeyboardInterrupt:
         state_node.get_logger().info("Shutting down Hold State Manager...")
     finally:
-        state_node.destroy_node()
-        rclpy.shutdown()
+        try:
+            state_node.destroy_node()
+        finally:
+            try:
+                rclpy.shutdown()
+            except Exception:
+                pass
 
 if __name__ == '__main__':
     main()

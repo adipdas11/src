@@ -75,11 +75,21 @@ def main(args=None):
         pass
     finally:
         if node.ser: 
-            # Optional: Send a 'stop' command (0) before closing
-            node.ser.write(b"0\n")
-            node.ser.close()
-        node.destroy_node()
-        rclpy.shutdown()
+            try:
+                node.ser.write(b"0\n")
+            except Exception:
+                pass
+            try:
+                node.ser.close()
+            except Exception:
+                pass
+        try:
+            node.destroy_node()
+        finally:
+            try:
+                rclpy.shutdown()
+            except Exception:
+                pass
 
 if __name__ == '__main__':
     main()

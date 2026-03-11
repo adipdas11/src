@@ -8,7 +8,7 @@ from collections import deque, OrderedDict
 # 1. ENVIRONMENT SETUP
 # =====================================================================
 # Inject virtual environment path for AI models
-VENV_PATH = '/home/adip/workspaces/disassembly_ws/src/vision_training/train_vision_model/.venv/lib/python3.10/site-packages'
+VENV_PATH = '/home/adip/workspace/disassembly_ws/src/vision_training/train_vision_model/.venv/lib/python3.10/site-packages'
 sys.path.insert(0, VENV_PATH)
 
 import rclpy
@@ -39,9 +39,9 @@ from vision_agent.agents.sniper import SniperAgent
 from vision_agent.agents.referee import RefereeAgent
 
 # --- MODEL PATHS ---
-PATH_SCOUT = "/home/adip/workspaces/disassembly_ws/src/vision_training/train_vision_model/project 1 (segmentation)/runs/segment/hdd_scout_run/weights/best.pt"
-PATH_SNIPER = "/home/adip/workspaces/disassembly_ws/src/vision_training/train_vision_model/project 2 (keypoint)/runs/pose/hdd_final_run/weights/best.pt"
-PATH_REFEREE = "/home/adip/workspaces/disassembly_ws/src/vision_training/train_vision_model/project 3 (classification)/runs/classify/hdd_referee_model/weights/best.pt"
+PATH_SCOUT = "/home/adip/workspace/disassembly_ws/src/vision_training/train_vision_model/project 1 (segmentation)/runs/segment/hdd_scout_run/weights/best.pt"
+PATH_SNIPER = "/home/adip/workspace/disassembly_ws/src/vision_training/train_vision_model/project 2 (keypoint)/runs/pose/hdd_final_run/weights/best.pt"
+PATH_REFEREE = "/home/adip/workspace/disassembly_ws/src/vision_training/train_vision_model/project 3 (classification)/runs/classify/hdd_referee_model/weights/best.pt"
 
 # --- ARUCO ZONE CONFIGURATION ---
 SHAPE_CONFIG = {

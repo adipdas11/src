@@ -77,22 +77,25 @@ public:
 
     // If we can't initialize, we return an error
     ret_ = sensor_state_machine();
-    if (ret_ == -1)
+    if (ret_ == -1 && !wait_for_other_connection())
     {
-      wait_for_other_connection();
+      return false;
     }
+    if (!rclcpp::ok()) return false;
     // Reads basic info on the sensor
     ret_ = sensor_state_machine();
-    if (ret_ == -1)
+    if (ret_ == -1 && !wait_for_other_connection())
     {
-      wait_for_other_connection();
+      return false;
     }
+    if (!rclcpp::ok()) return false;
     // Starts the stream
     ret_ = sensor_state_machine();
-    if (ret_ == -1)
+    if (ret_ == -1 && !wait_for_other_connection())
     {
-      wait_for_other_connection();
+      return false;
     }
+    if (!rclcpp::ok()) return false;
     // zero the sensor
     // set_zero();
 
@@ -138,7 +141,10 @@ public:
     ret_ = sensor_state_machine();
     if (ret_ == -1)
     {
-      wait_for_other_connection();
+      if (!wait_for_other_connection())
+      {
+        return false;
+      }
     }
 
     if (rq_sensor_get_current_state() == RQ_STATE_RUN)
@@ -230,7 +236,7 @@ private:
 
     return rq_sensor_state(max_retries_, ftdi_id);
   }
-  void wait_for_other_connection()
+  bool wait_for_other_connection()
   {
     INT_8 ret;
 
@@ -244,11 +250,12 @@ private:
       if (ret == 0)
       {
         RCLCPP_INFO(get_logger(), "Sensor connected!");
-        return;
+        return true;
       }
       // ros::spinOnce();
       // executor_.spin_once();
     }
+    return false;
   }
   robotiq_ft_sensor_interfaces::msg::FTSensor get_data(void)
   {
@@ -274,7 +281,15 @@ int main(int argc, char** argv)
   rclcpp::NodeOptions node_options;
   node_options.automatically_declare_parameters_from_overrides(true);
   auto node = std::make_shared<RQSensor>(node_options);
-  node->initialize();
+  if (!node->initialize())
+  {
+    if (rclcpp::ok())
+    {
+      RCLCPP_ERROR(node->get_logger(), "Robotiq FT sensor initialization failed");
+    }
+    rclcpp::shutdown();
+    return 1;
+  }
   rclcpp::executors::MultiThreadedExecutor executor;
   executor.add_node(node);
   executor.spin();

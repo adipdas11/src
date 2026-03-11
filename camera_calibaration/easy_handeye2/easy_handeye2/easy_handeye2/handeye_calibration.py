@@ -38,10 +38,44 @@ class HandeyeCalibrationParametersProvider:
         return ret
 
 
-def load_calibration(name) -> HandeyeCalibration:
-    filepath = filepath_for_calibration(name)
+def _normalize_legacy_calibration(data: dict, name: str) -> dict:
+    if not isinstance(data, dict):
+        raise ValueError(f'Calibration "{name}" must be a mapping, got {type(data).__name__}')
+
+    if 'parameters' in data and 'transform' in data:
+        parameters = dict(data['parameters'] or {})
+        transform = dict(data['transform'] or {})
+    else:
+        parameters = {}
+        transform = {}
+        for key, value in data.items():
+            if key in {'transform', 'translation', 'rotation'}:
+                continue
+            parameters[key] = value
+
+        if 'transform' in data:
+            transform = dict(data['transform'] or {})
+        else:
+            translation = dict(data.get('translation') or {})
+            rotation = dict(data.get('rotation') or {})
+            if translation or rotation:
+                transform = {'translation': translation, 'rotation': rotation}
+
+    legacy_eye_on_hand = parameters.pop('eye_on_hand', None)
+    if 'calibration_type' not in parameters and legacy_eye_on_hand is not None:
+        parameters['calibration_type'] = 'eye_in_hand' if legacy_eye_on_hand else 'eye_on_base'
+
+    return {
+        'parameters': parameters,
+        'transform': transform,
+    }
+
+
+def load_calibration(name, calibration_file=None) -> HandeyeCalibration:
+    filepath = pathlib.Path(calibration_file) if calibration_file else filepath_for_calibration(name)
     with open(filepath) as f:
         m = yaml.full_load(f.read())
+    m = _normalize_legacy_calibration(m, name)
     ret = HandeyeCalibration()
     set_message_fields(ret, m)
     return ret

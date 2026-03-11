@@ -13,11 +13,13 @@ class HandeyePublisher(rclpy.node.Node):
         super().__init__('handeye_publisher')
 
         self.declare_parameter('name', descriptor=ParameterDescriptor(type=ParameterType.PARAMETER_STRING))
+        self.declare_parameter('calibration_file', '')
         name = self.get_parameter('name').get_parameter_value().string_value
+        calibration_file = self.get_parameter('calibration_file').get_parameter_value().string_value
 
         self.get_logger().info(f'Loading the calibration with name {name}')
 
-        self.calibration = load_calibration(name)
+        self.calibration = load_calibration(name, calibration_file=calibration_file or None)
         parameters = self.calibration.parameters
 
         if parameters.calibration_type == 'eye_in_hand':

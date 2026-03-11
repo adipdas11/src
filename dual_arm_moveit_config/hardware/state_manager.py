@@ -53,7 +53,7 @@ class DisassemblyStateManager(Node):
             self.get_logger().error(f"Invalid Manip Arm state: {new_state}")
 
     def publish_combined_state(self):
-        """Publishes both states as a JSON string for easy parsing by the Agent."""
+        """Publish both states as a JSON string for easy parsing by the agent."""
         msg = String()
         msg.data = json.dumps(self.states)
         self.state_pub.publish(msg)
@@ -66,8 +66,13 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
-        node.destroy_node()
-        rclpy.shutdown()
+        try:
+            node.destroy_node()
+        finally:
+            try:
+                rclpy.shutdown()
+            except Exception:
+                pass
 
 if __name__ == '__main__':
     main()
