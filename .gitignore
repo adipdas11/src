@@ -9,6 +9,7 @@ vision_training/*.ckpt
 vision_training/Project 1 (Segmentation)/rfdetr/dataset_rfdetr_seg/
 vision_training/Project 1 (Segmentation)/rfdetr/HDD_Global_Scout-3/
 vision_training/Project 2 (Tool-Screw)/rfdetr/dataset_rfdetr_box_640/
+vision_training/Project 1 (Segmentation)/rfdetr/dataset_rfdetr_box_1080
 vision_training/Project 2 (Tool-Screw)/rfdetr/HDD_Local_Sniper-3/
 vision_training/Project 3 (Classification)/yolo11/dataset_cls_split/
 vision_training/Project 3 (Classification)/yolo11/HDD_Process_States-5
@@ -20,8 +21,9 @@ vision_training/**/runs/
 vision_training/**/*.pth
 vision_training/**/*.pt
 vision_training/**/*.ckpt
-isaac_export/*.usd
-*.usd
+# isaac_export/*.usd
+# *.usd
+
 
 
 # Editor/IDE
