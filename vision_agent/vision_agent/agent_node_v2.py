@@ -1,15 +1,23 @@
 #!/usr/bin/env python3
 import sys
 import os
+
+# Inject virtual environment path for AI models
+VENV_PATH = '/home/adip/workspace/disassembly_ws/src/vision_training/.venv/lib/python3.10/site-packages'
+sys.path.insert(0, VENV_PATH)
+
+# Silencing warnings
+os.environ['NO_ALBUMENTATIONS_UPDATE'] = '1'
+os.environ['TRANSFORMERS_VERBOSITY'] = 'error'
+os.environ['QT_LOGGING_RULES'] = '*.debug=false;qt.qpa.*=false'
+
+
 import math 
 from collections import deque, OrderedDict
 
 # =====================================================================
 # 1. ENVIRONMENT SETUP
 # =====================================================================
-# Inject virtual environment path for AI models
-VENV_PATH = '/home/adip/workspace/disassembly_ws/src/vision_training/train_vision_model/.venv/lib/python3.10/site-packages'
-sys.path.insert(0, VENV_PATH)
 
 import rclpy
 from rclpy.node import Node
@@ -27,7 +35,7 @@ from scipy.optimize import linear_sum_assignment
 # 2. CONFIGURATION & PARAMETERS
 # =====================================================================
 DASHBOARD_HEIGHT = 550  
-PROCESSING_RATE_HZ = 15.0 
+PROCESSING_RATE_HZ = 30.0 
 
 # --- LOCAL VIEW ALIGNMENT SETTINGS ---
 LOCAL_CROSSHAIR_OFFSET_X = 25  # pixels
@@ -39,9 +47,9 @@ from vision_agent.agents.sniper import SniperAgent
 from vision_agent.agents.referee import RefereeAgent
 
 # --- MODEL PATHS ---
-PATH_SCOUT = "/home/adip/workspace/disassembly_ws/src/vision_training/train_vision_model/project 1 (segmentation)/rt-detr/runs/detect/HDD_Disassembly/RTDETR_Global_1024/weights/best.pt"
-PATH_SNIPER = "/home/adip/workspace/disassembly_ws/src/vision_training/train_vision_model/project 2 (keypoint)/rt-detr/runs/detect/HDD_Disassembly/RTDETR_Local_640/weights/best.pt"
-PATH_REFEREE = "/home/adip/workspace/disassembly_ws/src/vision_training/train_vision_model/project 3 (classification)/runs/classify/hdd_referee_model/weights/best.pt"
+PATH_SCOUT = "/home/adip/workspace/disassembly_ws/src/vision_training/Project 1 (Segmentation)/rfdetr/global_model/checkpoint_best_ema.pt"
+PATH_SNIPER = "/home/adip/workspace/disassembly_ws/src/vision_training/Project 2 (Tool-Screw)/rfdetr/local_model/checkpoint_best_ema.pt"
+PATH_REFEREE = "/home/adip/workspace/disassembly_ws/src/vision_training/Project 3 (Classification)/yolo11/state_model/best.pt"
 
 # --- ARUCO ZONE CONFIGURATION ---
 SHAPE_CONFIG = {
@@ -211,6 +219,8 @@ class AgentNode(Node):
         
         self.wrench_offset = None          
         self.latest_zeroed_wrench = None   
+        self.frame_counter = 0 # To decouple Global vs Local frequencies
+        self.last_scout_results = ([], None) # Cache for Global scout
 
         # --- SUBSCRIBERS ---
         self.sub_global = self.create_subscription(CompressedImage, '/camera/camera/color/image_raw/compressed', self.cb_global, 10)
@@ -226,8 +236,8 @@ class AgentNode(Node):
         # --- PUBLISHERS ---
         self.json_pub = self.create_publisher(String, '/vision/agent_state', 10)
         self.bin_pub = self.create_publisher(String, '/vision/bin_coordinates', 10)
+        self.debug_pub_raw = self.create_publisher(Image, '/vision/debug_feed', 10)
         self.debug_pub_compressed = self.create_publisher(CompressedImage, '/vision/debug_feed/compressed', 10)
-        self.debug_pub_raw = self.create_publisher(Image, '/vision/debug_feed/raw', 10)
         
         # --- TIMER ---
         self.timer = self.create_timer(1.0 / PROCESSING_RATE_HZ, self.processing_loop)
@@ -446,7 +456,14 @@ class AgentNode(Node):
         vis_global = None
         
         if self.frame_global is not None:
-            vis_global = self.frame_global.copy()
+            # OPTIMIZATION: Run Global Scout at 5Hz (every 6th frame if loop is 30Hz)
+            if self.frame_counter % 6 == 0:
+                self.last_scout_results = self.scout.scan(self.frame_global)
+            
+            detections, vis_global = self.last_scout_results
+            if vis_global is None: vis_global = self.frame_global.copy()
+            else: vis_global = vis_global.copy() # Use the latest cached debug image
+            
             overlay = vis_global.copy()
             gray = cv2.cvtColor(vis_global, cv2.COLOR_BGR2GRAY)
             corners, ids, _ = self.detector.detectMarkers(gray)
@@ -679,7 +696,6 @@ class AgentNode(Node):
             
             dashboard = self.draw_wide_dashboard(top_row.shape[1], objects, bin_locations, status, self.latest_zeroed_wrench)
             final_frame = np.vstack((top_row, dashboard))
-            
             cv2.putText(final_frame, "GLOBAL (RGB+D)", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
             cv2.putText(final_frame, "TOOL CAMERA", (viz_g.shape[1]+20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
             
@@ -692,6 +708,8 @@ class AgentNode(Node):
             
         except Exception as e:
             self.get_logger().error(f"Vis Error: {e}")
+        
+        self.frame_counter += 1
 
 def main(args=None):
     rclpy.init(args=args)

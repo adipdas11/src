@@ -6,7 +6,6 @@ import os
 
 def generate_launch_description():
     # --- 1. DEFINE PATHS ---
-    # Using os.path.join is safer than manual string concatenation
     rs_pkg_share = FindPackageShare('realsense2_camera')
     tool_pkg_share = FindPackageShare('tool_camera_pkg')
     agent_pkg_share = FindPackageShare('vision_agent')
@@ -14,12 +13,12 @@ def generate_launch_description():
     # --- 2. DEFINE LAUNCH ACTIONS ---
     
     # A. RealSense (Global Scout)
-    # Added launch_arguments here
     launch_realsense = IncludeLaunchDescription(
         PythonLaunchDescriptionSource([rs_pkg_share, '/launch/rs_launch.py']),
         launch_arguments={
             'pointcloud.enable': 'true',
-            'align_depth.enable': 'true'
+            'align_depth.enable': 'true',
+            'pointcloud.allow_no_texture_points': 'true',
         }.items()
     )
 
@@ -40,7 +39,7 @@ def generate_launch_description():
         LogInfo(msg="🚀 [1/3] INITIALIZING GLOBAL SCOUT (REALSENSE)... 📷"),
         launch_realsense,
 
-        # T+3: Start Tool Camera (Wait 3s for RS to settle)
+        # T+3: Start Tool Camera
         TimerAction(
             period=3.0,
             actions=[
@@ -49,7 +48,7 @@ def generate_launch_description():
             ]
         ),
 
-        # T+6: Start AI Agent (Wait 3s for Tool Cam)
+        # T+6: Start AI Agent
         TimerAction(
             period=6.0,
             actions=[
