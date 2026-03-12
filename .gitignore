@@ -17,10 +17,10 @@ vision_training/Project 2 (Tool-Screw)/rfdetr/rf-detr-small.pth
 vision_training/Project 3 (Classification)/yolo11/yolo11n-cls.pt
 vision_training/Project 3 (Classification)/yolo11/yolo26n.pt
 vision_training/Project 1 (Segmentation)/rfdetr/rf-detr-seg-medium.pt
-vision_training/**/runs/
-vision_training/**/*.pth
-vision_training/**/*.pt
-vision_training/**/*.ckpt
+# vision_training/**/runs/
+# vision_training/**/*.pth
+# vision_training/**/*.pt
+# vision_training/**/*.ckpt
 # isaac_export/*.usd
 # *.usd
 
